@@ -74,6 +74,15 @@ const APP = Object.freeze({
 
 
   /**
+   * Remember unreadable messages for one processing job so write-mode queries
+   * can move past them without adding a Gmail label. Keep the list bounded to
+   * stay below the Apps Script User Properties value-size limit.
+   */
+  MAX_SKIPPED_MESSAGE_IDS:
+    250,
+
+
+  /**
    * Deliberately conservative token estimator.
    *
    * Used only to avoid crossing the user's run budget before
@@ -1294,6 +1303,14 @@ function startTriageJob(
         0,
 
 
+      skipped:
+        0,
+
+
+      skippedMessageIds:
+        [],
+
+
       spentUsd:
         0,
 
@@ -1397,16 +1414,29 @@ function processNextBatch(jobId, apiKey) {
         byName: ensureGmailLabels_(rules), technical: ensureTechnicalLabel_()
       };
       job.pending = job.pending || [];
+      job.skipped = Number(job.skipped || 0);
+      job.skippedMessageIds = Array.isArray(job.skippedMessageIds) ? job.skippedMessageIds : [];
       if (!job.pending.length) {
-        if (job.limit !== 'all' && job.processed >= job.limit) {
+        const handled = getJobHandledCount_(job);
+        if (job.limit !== 'all' && handled >= job.limit) {
           job.status = 'completed';
           job.stopReason = 'target-reached';
         } else {
-          const options = {q: job.query, maxResults: Math.min(APP.BATCH_SIZE,
-            job.limit === 'all' ? APP.BATCH_SIZE : job.limit - job.processed)};
+          const wanted = Math.min(APP.BATCH_SIZE,
+            job.limit === 'all' ? APP.BATCH_SIZE : job.limit - handled);
+          // Successful write-mode messages disappear from the query because
+          // they receive the technical marker. Skipped messages do not. Ask
+          // for enough leading results to move past the remembered skips.
+          const maxResults = job.dryRun ? wanted : Math.min(500,
+            wanted + job.skippedMessageIds.length);
+          const options = {q: job.query, maxResults: maxResults};
           if (job.dryRun && job.pageToken) options.pageToken = job.pageToken;
           const page = Gmail.Users.Messages.list('me', options);
-          job.pending = (page.messages || []).map(function(ref) { return {id: ref.id}; });
+          const skippedLookup = Object.create(null);
+          job.skippedMessageIds.forEach(function(id) { skippedLookup[id] = true; });
+          job.pending = (page.messages || []).filter(function(ref) {
+            return !skippedLookup[ref.id];
+          }).slice(0, wanted).map(function(ref) { return {id: ref.id}; });
           job.nextPageToken = page.nextPageToken || '';
           if (!job.pending.length) {
             job.status = 'completed';
@@ -1478,7 +1508,31 @@ function processNextBatch(jobId, apiKey) {
             }
             const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
             const body = extractMessageText_(full).slice(0, APP.MAX_BODY_CHARS);
-            if (!body) throw new Error('Required message content is unavailable; the message was left unchanged.');
+            if (!body) {
+              if (job.skippedMessageIds.indexOf(item.id) === -1) {
+                if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
+                  throw new Error('Too many messages have no readable text content. Narrow the Gmail scope and start a new session.');
+                }
+                job.skippedMessageIds.push(item.id);
+              }
+              job.skipped += 1;
+              job.pending.shift();
+              const skippedSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
+              const skippedFrom = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
+              events.push({level: 'warn', message: 'Skipped “' + skippedSubject + '” from ' + skippedFrom +
+                ' because Gmail did not provide readable message content. No labels or archive actions were applied.'});
+              results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+                label: 'Not assigned', confidence: round_(parsed.confidence, 3), stage: 'metadata',
+                action: 'skipped-no-content'});
+              const handledAfterSkip = getJobHandledCount_(job);
+              job.target = Math.max(job.target, handledAfterSkip + job.pending.length);
+              if (job.limit !== 'all' && handledAfterSkip >= job.limit) {
+                job.status = 'completed';
+                job.stopReason = 'target-reached';
+              }
+              saveJob_(job);
+              continue;
+            }
             parsed = classify(metadata, 'full', body);
             if (!parsed) break;
             selected = ruleFor(parsed);
@@ -1506,11 +1560,11 @@ function processNextBatch(jobId, apiKey) {
             job.pageToken = job.nextPageToken || '';
             if (!job.pageToken) { job.status = 'completed'; job.stopReason = 'no-more-messages'; }
           }
-          if (job.limit !== 'all' && job.processed >= job.limit) {
+          if (job.limit !== 'all' && getJobHandledCount_(job) >= job.limit) {
             job.status = 'completed'; job.stopReason = 'target-reached';
           }
         }
-        job.target = Math.max(job.target, job.processed + job.pending.length);
+        job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
         saveJob_(job);
         // Display metadata is deliberately not persisted in User Properties.
         let headers = {};
@@ -1528,11 +1582,11 @@ function processNextBatch(jobId, apiKey) {
           job.pageToken = job.nextPageToken || '';
           if (!job.pageToken) { job.status = 'completed'; job.stopReason = 'no-more-messages'; }
         }
-        if (job.limit !== 'all' && job.processed >= job.limit) {
+        if (job.limit !== 'all' && getJobHandledCount_(job) >= job.limit) {
           job.status = 'completed'; job.stopReason = 'target-reached';
         }
       }
-      if (job.status === 'completed') job.target = job.processed;
+      if (job.status === 'completed') job.target = getJobHandledCount_(job);
       events.push({level: job.status === 'budget' ? 'warn' : 'info', message:
         job.status === 'budget' ? 'The cost limit prevents the next model request. Unfinished messages remain unchanged.' :
         'Completed ' + results.length + ' message(s) in this batch.'});
@@ -3623,6 +3677,13 @@ function sanitizeJobForUi_(
       job.failed,
 
 
+    skipped:
+      Number(
+        job.skipped ||
+        0
+      ),
+
+
     spentUsd:
       round_(
         job.spentUsd,
@@ -3653,6 +3714,20 @@ function sanitizeJobForUi_(
 /* =====================================================================
  * SMALL HELPERS
  * ===================================================================== */
+
+
+function getJobHandledCount_(
+  job
+) {
+
+  return Number(
+    job && job.processed ||
+    0
+  ) + Number(
+    job && job.skipped ||
+    0
+  );
+}
 
 
 function ruleById_(
@@ -4450,7 +4525,7 @@ function getHtml_() {
 
 
         <p class="metricNote">
-          Messages completed in the current processing session.
+          Successfully classified and safely skipped messages in this session.
         </p>
 
 
@@ -4567,6 +4642,20 @@ function getHtml_() {
         </span>
 
         <b id="sArchived">
+          0
+        </b>
+
+      </div>
+
+
+
+      <div class="stat">
+
+        <span>
+          Skipped safely
+        </span>
+
+        <b id="sSkipped">
           0
         </b>
 
@@ -4927,6 +5016,26 @@ function getHtml_() {
     message
   ) {
 
+    var allowedLevels =
+      [
+        'info',
+        'success',
+        'warn',
+        'error',
+        'body'
+      ];
+
+
+    var safeLevel =
+      allowedLevels.indexOf(
+        level
+      ) !== -1
+
+        ? level
+
+        : 'info';
+
+
     var row =
       document.createElement(
         'div'
@@ -4935,34 +5044,66 @@ function getHtml_() {
 
     row.className =
       'logRow ' +
-      level;
+      safeLevel;
 
 
-    row.innerHTML =
+    var timeNode =
+      document.createElement(
+        'span'
+      );
 
-      '<span class="time">' +
 
-      esc(
-        nowTime()
-      ) +
+    timeNode.className =
+      'time';
 
-      '</span>' +
 
-      '<span class="level">' +
+    timeNode.textContent =
+      nowTime();
 
-      esc(
-        level
-      ) +
 
-      '</span>' +
+    var levelNode =
+      document.createElement(
+        'span'
+      );
 
-      '<span>' +
 
-      esc(
-        message
-      ) +
+    levelNode.className =
+      'level';
 
-      '</span>';
+
+    levelNode.textContent =
+      safeLevel;
+
+
+    var messageNode =
+      document.createElement(
+        'span'
+      );
+
+
+    messageNode.textContent =
+      String(
+        message == null
+
+          ? ''
+
+          : message
+      );
+
+
+    row.appendChild(
+      timeNode
+    );
+
+
+    row.appendChild(
+      levelNode
+    );
+
+
+    row.appendChild(
+      messageNode
+    );
 
 
     el(
@@ -6234,13 +6375,26 @@ function getHtml_() {
             'Label applied',
 
           'labeled + archived':
-            'Label applied; archived'
+            'Label applied; archived',
+
+          'skipped-no-content':
+            'Skipped: no readable content'
         };
 
         var tr =
           document.createElement(
             'tr'
           );
+
+
+        if (
+          row.action ===
+          'skipped-no-content'
+        ) {
+
+          tr.className =
+            'warningRow';
+        }
 
 
         tr.innerHTML =
@@ -6520,6 +6674,12 @@ function getHtml_() {
 
 
       el(
+        'jobPill'
+      ).className =
+        'pill';
+
+
+      el(
         'progressBar'
       ).style.width =
         '0%';
@@ -6546,6 +6706,8 @@ function getHtml_() {
         'sFull',
 
         'sArchived',
+
+        'sSkipped',
 
         'sFailed'
 
@@ -6625,6 +6787,23 @@ function getHtml_() {
       );
 
 
+    var skipped =
+      Math.max(
+
+        0,
+
+        Number(
+          j.skipped ||
+          0
+        )
+      );
+
+
+    var handled =
+      processed +
+      skipped;
+
+
     var pct =
 
       target
@@ -6633,7 +6812,7 @@ function getHtml_() {
 
             100,
 
-            processed /
+            handled /
             target *
             100
           )
@@ -6663,15 +6842,45 @@ function getHtml_() {
     };
 
 
+    var completedWithWarnings =
+      j.status === 'completed' &&
+      (
+        skipped > 0 ||
+        Number(j.failed || 0) > 0
+      );
+
+
     el(
       'jobPill'
     ).textContent =
 
-      statusLabels[
-        j.status
-      ] ||
+      completedWithWarnings
 
-      'Status unavailable';
+        ? 'Completed with warnings'
+
+        : statusLabels[
+            j.status
+          ] ||
+          'Status unavailable';
+
+
+    el(
+      'jobPill'
+    ).className =
+
+      'pill' +
+
+      (
+        completedWithWarnings
+
+          ? ' warn'
+
+          : j.status === 'completed'
+
+            ? ' good'
+
+            : ''
+      );
 
 
     el(
@@ -6689,13 +6898,13 @@ function getHtml_() {
       'progressText'
     ).textContent =
 
-      processed +
+      handled +
 
       ' of ' +
 
       target +
 
-      ' messages';
+      ' messages reviewed';
 
 
     el(
@@ -6734,6 +6943,12 @@ function getHtml_() {
     ).textContent =
       j.archived ||
       0;
+
+
+    el(
+      'sSkipped'
+    ).textContent =
+      skipped;
 
 
     el(
@@ -6895,10 +7110,28 @@ function getHtml_() {
       'completed'
     ) {
 
-      setStatus(
-        'Message processing completed.',
-        'good'
-      );
+      if (completedWithWarnings) {
+
+        setStatus(
+          skipped > 0
+
+            ? 'Processing completed with ' +
+              skipped +
+              ' message' +
+              (skipped === 1 ? '' : 's') +
+              ' safely skipped. No Gmail changes were made to skipped messages.'
+
+            : 'Processing completed after recovering from an earlier error. Review the activity log before clearing this session.',
+          'warn'
+        );
+
+      } else {
+
+        setStatus(
+          'Message processing completed.',
+          'good'
+        );
+      }
 
 
     } else if (

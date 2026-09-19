@@ -48,9 +48,10 @@ function fixture(count = 3, settings = {}) {
           clock += 10;
           const m = messages.find(m => m.id === id);
           if (options.format === 'full') calls.full++;
+          const emptyBody = settings.emptyBody || (settings.emptyBodyIds || []).includes(id);
           return {...m, snippet: 'Please review this request.', payload: {mimeType: 'text/plain',
             headers: [{name: 'From', value: 'sender@example.com'}, {name: 'Subject', value: 'Message ' + id}],
-            body: {data: settings.emptyBody ? '' : Buffer.from('Please approve the requested change.').toString('base64url')}}};
+            body: {data: emptyBody ? '' : Buffer.from('Please approve the requested change.').toString('base64url')}}};
         },
         batchModify(request) {
           if (settings.failWrite) {settings.failWrite = false; throw new Error('Temporary Gmail write failure');}
@@ -132,11 +133,26 @@ test('low confidence requires full content, and archive uses the final confidenc
   assert.ok(f.calls.writes[0].removeLabelIds.includes('INBOX'));
 });
 
-test('unavailable required body leaves the message unchanged and retains metadata decision', () => {
-  const f = fixture(1, {dryRun: false, confidence: 0.5, emptyBody: true}); let job = f.start();
-  job = f.batch(job.id).job; assert.equal(job.status, 'error'); assert.equal(f.calls.writes.length, 0);
-  f.settings.emptyBody = false; f.ctx.resumeTriageJob(job.id); job = f.batch(job.id).job;
-  assert.equal(job.processed, 1); assert.equal(f.calls.model, 2);
+test('unavailable required body is skipped safely and later messages continue', () => {
+  const f = fixture(19, {dryRun: false, confidence: 0.5, emptyBodyIds: ['1']}); let job = f.start();
+  const events = [], results = [];
+  for (let i = 0; i < 6 && job.status === 'running'; i++) {
+    const batch = f.batch(job.id); job = batch.job; events.push(...batch.events); results.push(...batch.results);
+  }
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 18);
+  assert.equal(job.skipped, 1); assert.equal(job.failed, 0); assert.equal(job.target, 19);
+  assert.equal(f.calls.model, 37); assert.equal(f.calls.full, 19); assert.equal(f.calls.writes.length, 18);
+  assert.ok(!f.calls.writes.some(request => request.ids.includes('1')));
+  assert.ok(events.some(event => event.level === 'warn' && /No labels or archive actions/.test(event.message)));
+  assert.ok(results.some(row => row.subject === 'Message 1' && row.action === 'skipped-no-content'));
+  assert.ok(Buffer.byteLength(f.data.get('JEV_CURRENT_JOB_V2')) <= 9000);
+});
+
+test('skipped messages count toward a numeric run limit', () => {
+  const f = fixture(19, {dryRun: false, confidence: 0.5, emptyBodyIds: ['1'], limit: 10}); let job = f.start();
+  for (let i = 0; i < 4 && job.status === 'running'; i++) job = f.batch(job.id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 9);
+  assert.equal(job.skipped, 1); assert.equal(job.target, 10); assert.equal(f.calls.writes.length, 9);
 });
 
 test('budget prevents dispatch and all Gmail message writes', () => {

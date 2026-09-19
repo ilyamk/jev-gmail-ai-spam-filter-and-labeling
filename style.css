@@ -661,6 +661,12 @@ a:focus-visible,
   color: var(--good);
 }
 
+.pill.warn {
+  border-color: #eeddb7;
+  background: #fff9ed;
+  color: var(--warn);
+}
+
 .pill.spam {
   border-color: #efd3d3;
   background: #fff7f7;
@@ -958,7 +964,7 @@ a:focus-visible,
 }
 
 .operationalStats {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   margin-top: 12px;
 }
 
@@ -1011,6 +1017,10 @@ a:focus-visible,
 .logRow.warn .level { color: var(--warn); }
 .logRow.error .level { color: var(--bad); }
 .logRow.body .level { color: #7257a7; }
+
+.resultsWrap tr.warningRow td {
+  background: #fffaf0;
+}
 
 .resultsWrap {
   max-height: 380px;
