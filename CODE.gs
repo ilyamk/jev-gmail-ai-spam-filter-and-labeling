@@ -74,6 +74,43 @@ const APP = Object.freeze({
 
 
   /**
+   * Retry one malformed or transient Jev response before deciding whether to
+   * skip one message or pause the session. Every attempt is charged against
+   * the user's configured cost limit.
+   */
+  JEV_RESPONSE_RETRIES:
+    1,
+
+
+  /**
+   * Short bounded backoff before the single retry. Longer provider outages
+   * pause the session instead of holding an Apps Script execution open.
+   */
+  JEV_RETRY_DELAY_MS:
+    400,
+
+  MAX_JEV_RETRY_DELAY_MS:
+    2000,
+
+
+  /**
+   * Stop consuming credits when several different messages receive invalid
+   * Jev responses in a row. A successful response resets this counter.
+   */
+  MAX_CONSECUTIVE_JEV_FAILURES:
+    3,
+
+
+  /**
+   * The documented Choice distribution sums to 1. Allow only floating-point
+   * boundary noise; materially incomplete distributions are retried and then
+   * skipped without changing Gmail.
+   */
+  PROBABILITY_SUM_TOLERANCE:
+    0.0100001,
+
+
+  /**
    * Remember unreadable messages for one processing job so write-mode queries
    * can move past them without adding a Gmail label. Keep the list bounded to
    * stay below the Apps Script User Properties value-size limit.
@@ -1307,6 +1344,18 @@ function startTriageJob(
         0,
 
 
+      providerRetries:
+        0,
+
+
+      modelResponseSkips:
+        0,
+
+
+      consecutiveJevFailures:
+        0,
+
+
       skippedMessageIds:
         [],
 
@@ -1415,6 +1464,9 @@ function processNextBatch(jobId, apiKey) {
       };
       job.pending = job.pending || [];
       job.skipped = Number(job.skipped || 0);
+      job.providerRetries = Number(job.providerRetries || 0);
+      job.modelResponseSkips = Number(job.modelResponseSkips || 0);
+      job.consecutiveJevFailures = Number(job.consecutiveJevFailures || 0);
       job.skippedMessageIds = Array.isArray(job.skippedMessageIds) ? job.skippedMessageIds : [];
       if (!job.pending.length) {
         const handled = getJobHandledCount_(job);
@@ -1466,20 +1518,101 @@ function processNextBatch(jobId, apiKey) {
             throw new Error('The classification request is too large. Shorten the label descriptions before starting a new session.');
           }
           const reserve = estimatePayloadCost_(payloadText);
-          if (job.spentUsd + reserve > job.maxSpendUsd) {
-            job.status = 'budget';
-            job.stopReason = 'budget';
-            return null;
+          const attempts = APP.JEV_RESPONSE_RETRIES + 1;
+          let parsed = null;
+          for (let attempt = 0; attempt < attempts; attempt++) {
+            if (job.spentUsd + reserve > job.maxSpendUsd) {
+              job.status = 'budget';
+              job.stopReason = 'budget';
+              return null;
+            }
+            if (attempt > 0) {
+              job.providerRetries += 1;
+              events.push({level: 'warn', message:
+                'Jev response validation failed (' + parsed.code + '): ' + parsed.error +
+                  ' Retrying once.'});
+              saveJob_(job);
+              Utilities.sleep(
+                Math.min(
+                  APP.MAX_JEV_RETRY_DELAY_MS,
+                  Math.max(APP.JEV_RETRY_DELAY_MS, Number(parsed.retryAfterMs) || 0)
+                )
+              );
+            }
+            // Reserve before every dispatch: a timeout or malformed response
+            // may still have incurred provider charges.
+            job.spentUsd += reserve;
+            saveJob_(job);
+            parsed = callJevParallel_([{payloadText: payloadText, estimatedCost: reserve}], key, rules)[0];
+            if (Number.isFinite(parsed.costUsd)) job.spentUsd += parsed.costUsd - reserve;
+            saveJob_(job);
+            if (parsed.ok) {
+              job.consecutiveJevFailures = 0;
+              saveJob_(job);
+              return parsed;
+            }
+            if (!parsed.retryable) throw new Error(parsed.error);
           }
-          // Reserve before dispatch: a timeout or malformed response may still
-          // have incurred provider charges. Never silently forget that spend.
-          job.spentUsd += reserve;
-          saveJob_(job);
-          const parsed = callJevParallel_([{payloadText: payloadText, estimatedCost: reserve}], key, rules)[0];
-          if (Number.isFinite(parsed.costUsd)) job.spentUsd += parsed.costUsd - reserve;
-          saveJob_(job);
-          if (!parsed.ok) throw new Error(parsed.error);
+          if (parsed && parsed.failureScope === 'session') {
+            job.status = 'paused';
+            job.stopReason = 'provider-temporary';
+            job.lastError = parsed.error;
+            events.push({level: 'warn', message:
+              parsed.error + ' Processing is paused; select Continue processing to try again later.'});
+            saveJob_(job);
+          }
           return parsed;
+        };
+
+        const skipCurrentMessage = function(metadata, options) {
+          const details = options || {};
+          if (job.skippedMessageIds.indexOf(item.id) === -1) {
+            if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
+              throw new Error('Too many messages were skipped safely in this session. Start a new session with a narrower Gmail scope.');
+            }
+            job.skippedMessageIds.push(item.id);
+          }
+          job.skipped += 1;
+          if (details.modelResponse) job.modelResponseSkips += 1;
+          job.pending.shift();
+          const skippedSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
+          const skippedFrom = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
+          events.push({level: 'warn', message: details.message(skippedSubject, skippedFrom)});
+          results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+            label: 'Not assigned', confidence: details.confidence === undefined ? '' : details.confidence,
+            stage: details.stage, action: details.action});
+          const handledAfterSkip = getJobHandledCount_(job);
+          job.target = Math.max(job.target, handledAfterSkip + job.pending.length);
+          if (job.limit !== 'all' && handledAfterSkip >= job.limit) {
+            job.status = 'completed';
+            job.stopReason = 'target-reached';
+          }
+          saveJob_(job);
+        };
+
+        const handleJevFailure = function(metadata, stage, parsed) {
+          if (job.status !== 'running') return false;
+          job.consecutiveJevFailures += 1;
+          if (job.consecutiveJevFailures >= APP.MAX_CONSECUTIVE_JEV_FAILURES) {
+            job.status = 'paused';
+            job.stopReason = 'jev-response-circuit-breaker';
+            job.lastError = 'Jev returned invalid responses for ' + job.consecutiveJevFailures +
+              ' consecutive messages. Processing was paused to protect the remaining API budget. Last issue: ' + parsed.error;
+            events.push({level: 'warn', message: job.lastError +
+              ' No Gmail changes were made to the current message. Continue later when the provider is stable.'});
+            saveJob_(job);
+            return false;
+          }
+          skipCurrentMessage(metadata, {
+            modelResponse: true,
+            stage: stage,
+            action: 'skipped-invalid-model-response',
+            message: function(subject, from) {
+              return 'Skipped “' + subject + '” from ' + from + ' because the Jev response could not be validated after one retry (' +
+                parsed.code + '). ' + parsed.error;
+            }
+          });
+          return true;
         };
         if (!item.final) {
           const message = Gmail.Users.Messages.get('me', item.id, {
@@ -1496,6 +1629,10 @@ function processNextBatch(jobId, apiKey) {
           if (!parsed) {
             parsed = classify(metadata, 'metadata', '');
             if (!parsed) break;
+            if (!parsed.ok) {
+              if (handleJevFailure(metadata, 'metadata', parsed)) continue;
+              break;
+            }
             item.metadataResult = {ruleId: parsed.ruleId, confidence: parsed.confidence};
             saveJob_(job);
           }
@@ -1509,32 +1646,23 @@ function processNextBatch(jobId, apiKey) {
             const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
             const body = extractMessageText_(full).slice(0, APP.MAX_BODY_CHARS);
             if (!body) {
-              if (job.skippedMessageIds.indexOf(item.id) === -1) {
-                if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
-                  throw new Error('Too many messages have no readable text content. Narrow the Gmail scope and start a new session.');
+              skipCurrentMessage(metadata, {
+                stage: 'metadata',
+                confidence: round_(parsed.confidence, 3),
+                action: 'skipped-no-content',
+                message: function(subject, from) {
+                  return 'Skipped “' + subject + '” from ' + from +
+                    ' because Gmail did not provide readable message content. No labels or archive actions were applied.';
                 }
-                job.skippedMessageIds.push(item.id);
-              }
-              job.skipped += 1;
-              job.pending.shift();
-              const skippedSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
-              const skippedFrom = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
-              events.push({level: 'warn', message: 'Skipped “' + skippedSubject + '” from ' + skippedFrom +
-                ' because Gmail did not provide readable message content. No labels or archive actions were applied.'});
-              results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
-                label: 'Not assigned', confidence: round_(parsed.confidence, 3), stage: 'metadata',
-                action: 'skipped-no-content'});
-              const handledAfterSkip = getJobHandledCount_(job);
-              job.target = Math.max(job.target, handledAfterSkip + job.pending.length);
-              if (job.limit !== 'all' && handledAfterSkip >= job.limit) {
-                job.status = 'completed';
-                job.stopReason = 'target-reached';
-              }
-              saveJob_(job);
+              });
               continue;
             }
             parsed = classify(metadata, 'full', body);
             if (!parsed) break;
+            if (!parsed.ok) {
+              if (handleJevFailure(metadata, 'full', parsed)) continue;
+              break;
+            }
             selected = ruleFor(parsed);
             stage = 'full';
           }
@@ -1587,9 +1715,16 @@ function processNextBatch(jobId, apiKey) {
         }
       }
       if (job.status === 'completed') job.target = getJobHandledCount_(job);
-      events.push({level: job.status === 'budget' ? 'warn' : 'info', message:
-        job.status === 'budget' ? 'The cost limit prevents the next model request. Unfinished messages remain unchanged.' :
-        'Completed ' + results.length + ' message(s) in this batch.'});
+      if (job.status === 'budget') {
+        events.push({level: 'warn', message:
+          'The cost limit prevents the next model request. Unfinished messages remain unchanged.'});
+      } else if (job.status === 'paused' && job.stopReason === 'runtime-guard') {
+        events.push({level: 'warn', message:
+          'Processing paused before the Apps Script execution limit. Continue processing to resume safely.'});
+      } else if (job.status === 'running' || job.status === 'completed') {
+        events.push({level: 'info', message:
+          'Reviewed ' + results.length + ' message(s) in this batch.'});
+      }
     } catch (error) {
       job.status = 'error';
       job.stopReason = 'processing-error';
@@ -3116,16 +3251,34 @@ function callJevParallel_(
   } catch (e) {
 
     return items.map(
-      function() {
+      function(item) {
 
         return {
 
           ok:
             false,
 
+          code:
+            'transport_error',
+
+          retryable:
+            true,
+
+          failureScope:
+            'session',
+
+          retryAfterMs:
+            0,
+
+          costUsd:
+            Math.max(
+              0,
+              Number(item && item.estimatedCost) || 0
+            ),
+
           error:
 
-            'OpenRouter transport error: ' +
+            'OpenRouter could not be reached. The request will be retried once before processing is paused. Technical detail: ' +
 
             String(
 
@@ -3176,8 +3329,13 @@ function callJevSingle_(
     );
 
 
-  const response =
-    UrlFetchApp.fetch(
+  let response;
+
+
+  try {
+
+    response =
+      UrlFetchApp.fetch(
 
       APP.OPENROUTER_URL,
 
@@ -3210,6 +3368,20 @@ function callJevSingle_(
       }
     );
 
+  } catch (e) {
+
+    return {
+      ok: false,
+      code: 'transport_error',
+      retryable: true,
+      failureScope: 'session',
+      retryAfterMs: 0,
+      costUsd: estimatePayloadCost_(payloadText),
+      error: 'OpenRouter could not be reached. Check the network connection and try again. Technical detail: ' +
+        String(e && e.message || e)
+    };
+  }
+
 
   return parseJevResponse_(
 
@@ -3231,6 +3403,16 @@ function callJevSingle_(
 function parseJevResponse_(response, rules, fallbackEstimatedCost) {
   const status = response.getResponseCode();
   const text = response.getContentText();
+  let retryAfterMs = 0;
+  try {
+    const headers = response.getAllHeaders ? response.getAllHeaders() : {};
+    const retryHeader = Object.keys(headers || {}).filter(function(key) {
+      return String(key).toLowerCase() === 'retry-after';
+    })[0];
+    const rawRetry = retryHeader ? headers[retryHeader] : '';
+    const retrySeconds = Number(Array.isArray(rawRetry) ? rawRetry[0] : rawRetry);
+    if (Number.isFinite(retrySeconds) && retrySeconds >= 0) retryAfterMs = retrySeconds * 1000;
+  } catch (ignored) {}
   const estimated = Math.max(0, Number(fallbackEstimatedCost) || 0);
   let json;
   try { json = JSON.parse(text); } catch (ignored) {}
@@ -3240,39 +3422,115 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
   const actualCost = typeof rawCost === 'number' ? rawCost :
     (typeof rawCost === 'string' && rawCost.trim() ? Number(rawCost) : NaN);
   const cost = Number.isFinite(actualCost) && actualCost >= 0 ? actualCost : estimated;
-  const failure = function(message) { return {ok: false, error: message, costUsd: cost}; };
+  const failure = function(code, message, options) {
+    const details = options || {};
+    return {
+      ok: false,
+      code: code,
+      error: message,
+      costUsd: cost,
+      retryable: details.retryable !== false,
+      failureScope: details.failureScope || 'message',
+      retryAfterMs: Math.min(APP.MAX_JEV_RETRY_DELAY_MS, Math.max(0, retryAfterMs)),
+      httpStatus: status,
+      diagnostics: details.diagnostics || null
+    };
+  };
   if (status < 200 || status >= 300) {
     // Do not echo arbitrary provider response text that might contain request data.
-    return failure('OpenRouter returned HTTP ' + status + '. Check the API key, balance, and provider availability.');
+    if (status === 401) {
+      return failure('authentication_failed',
+        'OpenRouter rejected the API key. Verify or replace the key before continuing.',
+        {retryable: false, failureScope: 'session'});
+    }
+    if (status === 402) {
+      return failure('insufficient_credits',
+        'OpenRouter reports insufficient credits. Add credits or use a key with an available balance.',
+        {retryable: false, failureScope: 'session'});
+    }
+    if (status === 403) {
+      return failure('access_denied',
+        'OpenRouter denied access to the requested model. Check the key permissions and workspace limits.',
+        {retryable: false, failureScope: 'session'});
+    }
+    if ([408, 409, 425, 429].indexOf(status) !== -1 || status >= 500) {
+      return failure('provider_temporarily_unavailable',
+        'OpenRouter temporarily returned HTTP ' + status + '. No Gmail changes were made.',
+        {retryable: true, failureScope: 'session'});
+    }
+    return failure('request_rejected',
+      'OpenRouter rejected the Decisions request with HTTP ' + status + '. No Gmail changes were made.',
+      {retryable: false, failureScope: 'session'});
   }
-  if (!json || typeof json !== 'object') return failure('OpenRouter returned invalid JSON.');
+  if (!json || typeof json !== 'object') {
+    return failure('invalid_json',
+      'OpenRouter returned a response that was not valid JSON. No Gmail changes were made.');
+  }
   const answer = json.answers && json.answers.label;
-  if (!answer || typeof answer !== 'object') return failure('Jev response is missing answers.label.');
+  if (!answer || typeof answer !== 'object') {
+    return failure('missing_answer',
+      'Jev returned no classification answer. No Gmail changes were made.');
+  }
   const choice = typeof answer.choice === 'string' ? answer.choice : '';
   const match = /^L(0|[1-9]\d*)$/.exec(choice);
   const rule = match && rules[Number(match[1])];
-  if (!rule) return failure('Jev returned a label outside the configured rules.');
+  if (!rule) {
+    return failure('invalid_choice',
+      'Jev returned a label outside the configured classification rules. No Gmail changes were made.');
+  }
   // Jev confidence measures distribution separation and is NOT the selected
   // option probability. Use the documented confidence for both thresholds.
   const confidence = answer.confidence;
   if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-    return failure('Jev returned an invalid confidence value; no Gmail action was taken.');
+    return failure('invalid_confidence',
+      'Jev returned an invalid confidence value. No Gmail changes were made.');
   }
   const probabilities = answer.probabilities;
   if (!probabilities || typeof probabilities !== 'object' || Array.isArray(probabilities)) {
-    return failure('Jev returned an invalid probability distribution.');
+    return failure('invalid_probabilities',
+      'Jev returned an invalid probability distribution. No Gmail changes were made.');
+  }
+  const expectedKeys = rules.map(function(rule, index) { return 'L' + index; });
+  const returnedKeys = Object.keys(probabilities);
+  const expectedLookup = Object.create(null);
+  expectedKeys.forEach(function(key) { expectedLookup[key] = true; });
+  const missingKeys = expectedKeys.filter(function(key) {
+    return !Object.prototype.hasOwnProperty.call(probabilities, key);
+  });
+  const unexpectedKeys = returnedKeys.filter(function(key) { return !expectedLookup[key]; });
+  if (missingKeys.length) {
+    return failure('missing_probabilities',
+      'Jev omitted ' + missingKeys.length + ' of ' + expectedKeys.length +
+        ' configured class probabilities. No Gmail changes were made.',
+      {diagnostics: {expectedCount: expectedKeys.length, receivedCount: returnedKeys.length,
+        missingCount: missingKeys.length, unexpectedCount: unexpectedKeys.length}});
+  }
+  if (unexpectedKeys.length) {
+    return failure('unexpected_probability_keys',
+      'Jev returned ' + unexpectedKeys.length + ' unexpected probability ' +
+        (unexpectedKeys.length === 1 ? 'key' : 'keys') + '. No Gmail changes were made.',
+      {diagnostics: {expectedCount: expectedKeys.length, receivedCount: returnedKeys.length,
+        missingCount: 0, unexpectedCount: unexpectedKeys.length}});
   }
   let total = 0;
   for (let i = 0; i < rules.length; i++) {
     const p = probabilities['L' + i];
     if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) {
-      return failure('Jev returned an invalid class probability.');
+      return failure('invalid_probability_value',
+        'Jev returned an invalid class probability. No Gmail changes were made.');
     }
-    if (p > probabilities[choice] + 0.000001) return failure('Jev choice contradicts its probability distribution.');
+    if (p > probabilities[choice] + 0.000001) {
+      return failure('choice_probability_mismatch',
+        'Jev selected a class that does not have the highest probability. No Gmail changes were made.');
+    }
     total += p;
   }
-  if (Object.keys(probabilities).length !== rules.length || Math.abs(total - 1) > 0.01) {
-    return failure('Jev returned an incomplete probability distribution.');
+  if (Math.abs(total - 1) > APP.PROBABILITY_SUM_TOLERANCE) {
+    return failure('probability_sum_mismatch',
+      'Jev returned class probabilities with a total of ' + round_(total, 6) +
+        ' instead of 1. No Gmail changes were made.',
+      {diagnostics: {expectedCount: expectedKeys.length, receivedCount: returnedKeys.length,
+        probabilitySum: round_(total, 6)}});
   }
   return {ok: true, ruleId: rule.id, confidence: confidence, probabilities: probabilities,
     costUsd: cost, inputTokens: Number(usage.input_tokens || usage.prompt_tokens || 0),
@@ -3680,6 +3938,20 @@ function sanitizeJobForUi_(
     skipped:
       Number(
         job.skipped ||
+        0
+      ),
+
+
+    providerRetries:
+      Number(
+        job.providerRetries ||
+        0
+      ),
+
+
+    modelResponseSkips:
+      Number(
+        job.modelResponseSkips ||
         0
       ),
 
@@ -4666,7 +4938,21 @@ function getHtml_() {
       <div class="stat">
 
         <span>
-          Errors
+          Model retries
+        </span>
+
+        <b id="sRetries">
+          0
+        </b>
+
+      </div>
+
+
+
+      <div class="stat">
+
+        <span>
+          Session errors
         </span>
 
         <b id="sFailed">
@@ -6378,7 +6664,10 @@ function getHtml_() {
             'Label applied; archived',
 
           'skipped-no-content':
-            'Skipped: no readable content'
+            'Skipped: no readable content',
+
+          'skipped-invalid-model-response':
+            'Skipped safely: invalid Jev response'
         };
 
         var tr =
@@ -6388,8 +6677,12 @@ function getHtml_() {
 
 
         if (
-          row.action ===
-          'skipped-no-content'
+          [
+            'skipped-no-content',
+            'skipped-invalid-model-response'
+          ].indexOf(
+            row.action
+          ) !== -1
         ) {
 
           tr.className =
@@ -6709,6 +7002,8 @@ function getHtml_() {
 
         'sSkipped',
 
+        'sRetries',
+
         'sFailed'
 
       ].forEach(
@@ -6842,12 +7137,20 @@ function getHtml_() {
     };
 
 
+    var hasWarnings =
+      skipped > 0 ||
+      Number(j.providerRetries || 0) > 0 ||
+      Number(j.failed || 0) > 0;
+
+
     var completedWithWarnings =
       j.status === 'completed' &&
-      (
-        skipped > 0 ||
-        Number(j.failed || 0) > 0
-      );
+      hasWarnings;
+
+
+    var runningWithWarnings =
+      j.status === 'running' &&
+      hasWarnings;
 
 
     el(
@@ -6857,6 +7160,10 @@ function getHtml_() {
       completedWithWarnings
 
         ? 'Completed with warnings'
+
+        : runningWithWarnings
+
+          ? 'Processing with warnings'
 
         : statusLabels[
             j.status
@@ -6871,13 +7178,21 @@ function getHtml_() {
       'pill' +
 
       (
-        completedWithWarnings
+        completedWithWarnings || runningWithWarnings
 
           ? ' warn'
 
           : j.status === 'completed'
 
             ? ' good'
+
+            : j.status === 'paused' || j.status === 'budget'
+
+              ? ' warn'
+
+              : j.status === 'error'
+
+                ? ' spam'
 
             : ''
       );
@@ -6949,6 +7264,13 @@ function getHtml_() {
       'sSkipped'
     ).textContent =
       skipped;
+
+
+    el(
+      'sRetries'
+    ).textContent =
+      j.providerRetries ||
+      0;
 
 
     el(
@@ -7171,10 +7493,24 @@ function getHtml_() {
       'paused'
     ) {
 
-      setStatus(
-        'Processing was paused before the Apps Script execution limit. Select Continue processing to proceed.',
-        'warn'
-      );
+      if (
+        j.stopReason === 'provider-temporary' ||
+        j.stopReason === 'jev-response-circuit-breaker'
+      ) {
+
+        setStatus(
+          (j.lastError || 'The model service is temporarily unavailable.') +
+            ' No Gmail changes were made to the current message. Select Continue processing to try again.',
+          'warn'
+        );
+
+      } else {
+
+        setStatus(
+          'Processing was paused before the Apps Script execution limit. Select Continue processing to proceed.',
+          'warn'
+        );
+      }
 
 
     } else if (
@@ -7191,10 +7527,23 @@ function getHtml_() {
 
     } else {
 
-      setStatus(
-        'Processing messages. Keep this tab open until the session completes.',
-        ''
-      );
+      if (hasWarnings) {
+
+        setStatus(
+          'Processing continues safely after ' + Number(j.providerRetries || 0) +
+            (Number(j.providerRetries || 0) === 1 ? ' model retry' : ' model retries') +
+            ' and ' + skipped + ' skipped message' + (skipped === 1 ? '' : 's') +
+            '. Skipped messages remain unchanged in Gmail.',
+          'warn'
+        );
+
+      } else {
+
+        setStatus(
+          'Processing messages. Keep this tab open until the session completes.',
+          ''
+        );
+      }
     }
   }
 

@@ -28,6 +28,7 @@ function fixture(count = 3, settings = {}) {
     Utilities: {
       getUuid: () => 'uuid-' + (++serial),
       base64DecodeWebSafe: s => Buffer.from(s, 'base64url'),
+      sleep: () => {},
       newBlob: value => ({getBytes: () => [...Buffer.from(value)], getDataAsString: () => Buffer.from(value).toString('utf8')})
     },
     Gmail: {Users: {
@@ -70,6 +71,7 @@ function fixture(count = 3, settings = {}) {
           assert.equal(request.headers.Authorization, 'Bearer ephemeral-key');
           if (settings.failModelAt === calls.model) throw new Error('Transport timeout');
           const payload = JSON.parse(request.payload);
+          if (settings.modelResponder) return settings.modelResponder({payload, call: calls.model, request});
           const confidence = payload.state.evidence_stage === 'full_body' ? 0.96 : (settings.confidence ?? 0.96);
           return response({answers: {label: {choice: 'L0', confidence, probabilities: {L0: 1}}}, usage: {cost: 0.00001}});
         });
@@ -117,12 +119,12 @@ test('write failure resumes a persisted decision without another paid request', 
   assert.equal(job.processed, 1); assert.equal(f.calls.model, 1); assert.equal(f.calls.writes.length, 1);
 });
 
-test('partial preview failure resumes the remaining IDs without recounting successes', () => {
+test('a transient model transport failure retries once and continues the batch', () => {
   const f = fixture(10, {failModelAt: 2}); let job = f.start();
-  job = f.batch(job.id).job; assert.equal(job.processed, 1); assert.equal(job.status, 'error');
-  const spentBefore = job.spentUsd; assert.ok(spentBefore > 0.00001);
-  f.ctx.resumeTriageJob(job.id);
-  for (let i = 0; i < 4; i++) {job = f.batch(job.id).job; if (job.status !== 'running') break;}
+  let batch = f.batch(job.id); job = batch.job;
+  assert.equal(job.processed, 8); assert.equal(job.status, 'running'); assert.equal(job.providerRetries, 1);
+  assert.ok(batch.events.some(event => /Retrying once/.test(event.message)));
+  job = f.batch(job.id).job;
   assert.equal(job.processed, 10); assert.equal(job.status, 'completed'); assert.equal(f.calls.model, 11);
 });
 
@@ -187,6 +189,95 @@ test('confidence is not replaced by selected probability; malformed confidence f
     json.answers.label.confidence = bad;
     assert.equal(f.ctx.parseJevResponse_(response(json), rules, 0.01).ok, false);
   }
+});
+
+test('Jev payload follows the Decisions Choice contract and keeps the latest model alias', () => {
+  let captured;
+  const f = fixture(1, {modelResponder({payload}) {
+    captured = payload;
+    return response({answers: {label: {choice: 'L0', confidence: 1, probabilities: {L0: 1}}}});
+  }});
+  const result = f.batch(f.start().id);
+  assert.equal(result.job.status, 'completed');
+  assert.equal(captured.model, '~typesafe/jev-latest');
+  assert.equal(captured.questions.label.type, 'choice');
+  assert.equal(typeof captured.questions.label.instructions, 'object');
+  assert.equal(captured.questions.label.criteria.L0.gmail_label, 'review');
+  assert.equal(captured.questions.label.criteria.L0.assign_when, 'A message to review.');
+  assert.equal(captured.state.evidence_stage, 'metadata_only');
+  assert.equal(captured.state.email.subject, 'Message 1');
+});
+
+test('probability validation reports precise contract failures and permits boundary noise', () => {
+  const f = fixture();
+  const rules = [f.rules[0], {...f.rules[0], id: 'second'}];
+  const parse = probabilities => f.ctx.parseJevResponse_(response({answers: {label: {
+    choice: 'L0', confidence: 0.8, probabilities
+  }}}), rules, 0.01);
+  assert.equal(parse({L0: 0.7}).code, 'missing_probabilities');
+  assert.equal(parse({L0: 0.7, L1: 0.3, other: 0}).code, 'unexpected_probability_keys');
+  assert.equal(parse({L0: 0.7, L1: 0.27}).code, 'probability_sum_mismatch');
+  assert.equal(parse({L0: 0.51, L1: 0.5}).ok, true);
+});
+
+test('an invalid Jev distribution is retried once and a valid retry is used', () => {
+  const f = fixture(1, {modelResponder({call}) {
+    const probabilities = call === 1 ? {L0: 0.98} : {L0: 1};
+    return response({answers: {label: {choice: 'L0', confidence: 0.95, probabilities}}, usage: {cost: 0.00001}});
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed');
+  assert.equal(batch.job.processed, 1); assert.equal(batch.job.skipped, 0);
+  assert.equal(batch.job.providerRetries, 1); assert.equal(f.calls.model, 2);
+  assert.ok(batch.events.some(event => /probability_sum_mismatch/.test(event.message)));
+});
+
+test('a persistently invalid Jev response skips only that message and continues safely', () => {
+  const settings = {dryRun: false};
+  settings.modelResponder = ({payload}) => {
+    const bad = payload.state.email.subject === 'Message 1';
+    return response({answers: {label: {choice: 'L0', confidence: 0.95,
+      probabilities: bad ? {L0: 0.98} : {L0: 1}}}, usage: {cost: 0.00001}});
+  };
+  const f = fixture(2, settings); let job = f.start(); const results = [];
+  for (let i = 0; i < 3 && job.status === 'running'; i++) {
+    const batch = f.batch(job.id); job = batch.job; results.push(...batch.results);
+  }
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 1); assert.equal(job.skipped, 1);
+  assert.equal(job.modelResponseSkips, 1); assert.equal(job.providerRetries, 1); assert.equal(job.failed, 0);
+  assert.equal(f.calls.model, 3); assert.equal(f.calls.writes.length, 1);
+  assert.ok(!f.calls.writes.some(request => request.ids.includes('1')));
+  assert.ok(results.some(row => row.subject === 'Message 1' && row.action === 'skipped-invalid-model-response'));
+});
+
+test('three consecutive invalid Jev responses open the circuit breaker without consuming the inbox', () => {
+  const f = fixture(4, {dryRun: false, modelResponder() {
+    return response({answers: {label: {choice: 'L0', confidence: 0.95, probabilities: {L0: 0.98}}}});
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'paused');
+  assert.equal(batch.job.stopReason, 'jev-response-circuit-breaker');
+  assert.equal(batch.job.processed, 0); assert.equal(batch.job.skipped, 2);
+  assert.equal(batch.job.modelResponseSkips, 2); assert.equal(batch.job.providerRetries, 3);
+  assert.equal(f.calls.model, 6); assert.equal(f.calls.writes.length, 0);
+  assert.match(batch.job.lastError, /3 consecutive messages/);
+});
+
+test('a persistent provider outage pauses instead of skipping messages or failing the session', () => {
+  const f = fixture(2, {modelResponder() { throw new Error('Provider connection reset'); }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'paused'); assert.equal(batch.job.stopReason, 'provider-temporary');
+  assert.equal(batch.job.processed, 0); assert.equal(batch.job.skipped, 0); assert.equal(batch.job.failed, 0);
+  assert.equal(batch.job.providerRetries, 1); assert.equal(f.calls.model, 2);
+  assert.match(batch.job.lastError, /could not be reached/);
+});
+
+test('authentication failures remain session-level and are not retried', () => {
+  const f = fixture(1, {modelResponder() { return response({error: 'unauthorized'}, 401); }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'error'); assert.equal(batch.job.failed, 1);
+  assert.equal(batch.job.providerRetries, 0); assert.equal(f.calls.model, 1);
+  assert.match(batch.job.lastError, /rejected the API key/);
 });
 
 test('large Unicode rule sets fit property limits and survive read/reset', () => {
