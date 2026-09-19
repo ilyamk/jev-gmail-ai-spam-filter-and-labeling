@@ -135,23 +135,25 @@ test('low confidence requires full content, and archive uses the final confidenc
   assert.ok(f.calls.writes[0].removeLabelIds.includes('INBOX'));
 });
 
-test('unavailable required body is skipped safely and later messages continue', () => {
+test('unavailable required body uses the safe review fallback and later messages continue', () => {
   const f = fixture(19, {dryRun: false, confidence: 0.5, emptyBodyIds: ['1']}); let job = f.start();
   const events = [], results = [];
   for (let i = 0; i < 6 && job.status === 'running'; i++) {
     const batch = f.batch(job.id); job = batch.job; events.push(...batch.events); results.push(...batch.results);
   }
-  assert.equal(job.status, 'completed'); assert.equal(job.processed, 18);
-  assert.equal(job.skipped, 1); assert.equal(job.failed, 0); assert.equal(job.target, 19);
-  assert.equal(f.calls.model, 37); assert.equal(f.calls.full, 19); assert.equal(f.calls.writes.length, 18);
-  assert.ok(!f.calls.writes.some(request => request.ids.includes('1')));
-  assert.ok(events.some(event => event.level === 'warn' && /No labels or archive actions/.test(event.message)));
-  assert.ok(results.some(row => row.subject === 'Message 1' && row.action === 'skipped-no-content'));
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 19);
+  assert.equal(job.skipped, 0); assert.equal(job.failed, 0); assert.equal(job.target, 19);
+  assert.equal(f.calls.model, 37); assert.equal(f.calls.full, 19); assert.equal(f.calls.writes.length, 19);
+  assert.ok(f.calls.writes.some(request => request.ids.includes('1')));
+  assert.ok(events.some(event => event.level === 'warn' && /safe “review” fallback/.test(event.message)));
+  assert.ok(results.some(row => row.subject === 'Message 1' && row.action === 'review fallback applied'));
   assert.ok(Buffer.byteLength(f.data.get('JEV_CURRENT_JOB_V2')) <= 9000);
 });
 
-test('skipped messages count toward a numeric run limit', () => {
-  const f = fixture(19, {dryRun: false, confidence: 0.5, emptyBodyIds: ['1'], limit: 10}); let job = f.start();
+test('messages without content or a review fallback are skipped and count toward the limit', () => {
+  const f = fixture(19, {dryRun: false, confidence: 0.5, emptyBodyIds: ['1'], limit: 10});
+  f.options.rules = [{...f.rules[0], name: 'manual-check'}];
+  let job = f.start();
   for (let i = 0; i < 4 && job.status === 'running'; i++) job = f.batch(job.id).job;
   assert.equal(job.status, 'completed'); assert.equal(job.processed, 9);
   assert.equal(job.skipped, 1); assert.equal(job.target, 10); assert.equal(f.calls.writes.length, 9);
@@ -300,6 +302,35 @@ test('text attachments excluded from message classification body', () => {
     {mimeType: 'text/plain', filename: 'private.txt', body: {data: enc('Secret attachment')}}
   ]}});
   assert.equal(body, 'Actual body');
+});
+
+test('image-heavy HTML preserves readable alt and title text', () => {
+  const f = fixture(); const enc = s => Buffer.from(s).toString('base64url');
+  const body = f.ctx.extractMessageText_({payload: {mimeType: 'text/html', body: {data: enc(
+    '<html><body><img alt="Remove your background"><img title="Open editor"></body></html>'
+  )}}});
+  assert.equal(body, 'Remove your background Open editor');
+});
+
+test('external Gmail text-part failures return safe MIME diagnostics instead of throwing', () => {
+  const f = fixture();
+  f.ctx.Gmail.Users.Messages.Attachments = {get() { throw new Error('Attachment temporarily unavailable'); }};
+  const extracted = f.ctx.extractMessageContent_({id: '1', payload: {mimeType: 'multipart/alternative', parts: [
+    {mimeType: 'text/html', body: {attachmentId: 'body'}}
+  ]}});
+  assert.equal(extracted.text, '');
+  assert.equal(extracted.reason, 'An external Gmail text part could not be retrieved.');
+  assert.equal(extracted.diagnostics.externalTextErrors, 1);
+});
+
+test('review fallback is never archived when full message text is unavailable', () => {
+  const f = fixture(1, {dryRun: false, confidence: 0.5, emptyBody: true});
+  f.options.mode = 'labels_archive';
+  let job = f.start(); const first = f.batch(job.id); job = first.job;
+  if (job.status === 'running') job = f.batch(job.id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.archived, 0);
+  assert.equal(first.results[0].action, 'review fallback applied');
+  assert.ok(!f.calls.writes[0].removeLabelIds);
 });
 
 test('idle time between batches is excluded from processing duration', () => {

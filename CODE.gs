@@ -1644,27 +1644,43 @@ function processNextBatch(jobId, apiKey) {
               job.status = 'paused'; job.stopReason = 'runtime-guard'; break;
             }
             const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
-            const body = extractMessageText_(full).slice(0, APP.MAX_BODY_CHARS);
+            const extracted = extractMessageContent_(full);
+            const body = extracted.text.slice(0, APP.MAX_BODY_CHARS);
             if (!body) {
-              skipCurrentMessage(metadata, {
-                stage: 'metadata',
-                confidence: round_(parsed.confidence, 3),
-                action: 'skipped-no-content',
-                message: function(subject, from) {
-                  return 'Skipped “' + subject + '” from ' + from +
-                    ' because Gmail did not provide readable message content. No labels or archive actions were applied.';
-                }
-              });
-              continue;
+              const reviewFallback = rules.filter(function(rule) {
+                return !rule.spam &&
+                  (rule.id === 'review' || String(rule.name || '').toLowerCase() === 'review');
+              })[0];
+              if (reviewFallback) {
+                selected = reviewFallback;
+                stage = 'metadata_fallback';
+                const fallbackSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
+                events.push({level: 'warn', message:
+                  'Could not extract full text from “' + fallbackSubject + '”: ' + extracted.reason +
+                  ' The safe “' + reviewFallback.name + '” fallback ' +
+                  (job.dryRun ? 'would be applied in a live run.' : 'will be applied without archiving.')});
+              } else {
+                skipCurrentMessage(metadata, {
+                  stage: 'metadata',
+                  confidence: round_(parsed.confidence, 3),
+                  action: 'skipped-no-content',
+                  message: function(subject, from) {
+                    return 'Skipped “' + subject + '” from ' + from + ' because the app could not extract readable text. ' +
+                      extracted.reason + ' No safe review fallback is configured, so no labels or archive actions were applied.';
+                  }
+                });
+                continue;
+              }
+            } else {
+              parsed = classify(metadata, 'full', body);
+              if (!parsed) break;
+              if (!parsed.ok) {
+                if (handleJevFailure(metadata, 'full', parsed)) continue;
+                break;
+              }
+              selected = ruleFor(parsed);
+              stage = 'full';
             }
-            parsed = classify(metadata, 'full', body);
-            if (!parsed) break;
-            if (!parsed.ok) {
-              if (handleJevFailure(metadata, 'full', parsed)) continue;
-              break;
-            }
-            selected = ruleFor(parsed);
-            stage = 'full';
           }
           // Persist only the decision, never message text or headers.
           item.final = {ruleId: selected.id, confidence: parsed.confidence, stage: stage};
@@ -1679,7 +1695,7 @@ function processNextBatch(jobId, apiKey) {
         if (!job.dryRun) applyFinalResults_([final], rules, job, labelContext);
         job.processed += 1;
         job.labelCounts[selected.id] = Number(job.labelCounts[selected.id] || 0) + 1;
-        if (decision.stage === 'metadata') job.metadataOnly += 1;
+        if (decision.stage === 'metadata' || decision.stage === 'metadata_fallback') job.metadataOnly += 1;
         else job.fullBody += 1;
         if (final.archive && !job.dryRun) job.archived += 1;
         job.pending.shift();
@@ -1703,7 +1719,10 @@ function processNextBatch(jobId, apiKey) {
         } catch (ignored) {}
         results.push({from: headers.from || '', subject: headers.subject || '', label: selected.name,
           confidence: round_(decision.confidence, 3), stage: decision.stage,
-          action: final.archive ? (job.dryRun ? 'would archive' : 'archived') : (job.dryRun ? 'would label' : 'labeled')});
+          action: decision.stage === 'metadata_fallback'
+            ? (job.dryRun ? 'would apply review fallback' : 'review fallback applied')
+            : final.archive ? (job.dryRun ? 'would archive' : 'archived')
+              : (job.dryRun ? 'would label' : 'labeled')});
       }
       if (job.status === 'running' && !job.pending.length) {
         if (job.dryRun) {
@@ -2698,6 +2717,19 @@ function extractMessageText_(
   message
 ) {
 
+  return extractMessageContent_(message).text;
+}
+
+
+
+/**
+ * Extract message text and a content-free reason when extraction fails.
+ * Diagnostics contain MIME shape counters only; email content is never logged.
+ */
+function extractMessageContent_(
+  message
+) {
+
   const payload =
     message &&
     message.payload;
@@ -2705,7 +2737,10 @@ function extractMessageText_(
 
   if (!payload) {
 
-    return '';
+    return {
+      text: '',
+      reason: 'Gmail returned no MIME payload.'
+    };
   }
 
 
@@ -2717,6 +2752,16 @@ function extractMessageText_(
     [];
 
 
+  const diagnostics = {
+    textParts: 0,
+    inlineTextParts: 0,
+    externalTextParts: 0,
+    externalTextErrors: 0,
+    emptyDecodedParts: 0,
+    skippedAttachments: 0
+  };
+
+
   collectTextParts_(
 
     payload,
@@ -2725,7 +2770,9 @@ function extractMessageText_(
 
     html,
 
-    message.id
+    message.id,
+
+    diagnostics
   );
 
 
@@ -2752,7 +2799,7 @@ function extractMessageText_(
   }
 
 
-  return text
+  text = text
 
     .replace(
       /\u0000/g,
@@ -2760,6 +2807,41 @@ function extractMessageText_(
     )
 
     .trim();
+
+
+  let reason = '';
+
+
+  if (!text) {
+
+    if (diagnostics.textParts === 0) {
+
+      reason = 'No readable text/plain or text/html MIME part was available.';
+
+    } else if (diagnostics.externalTextErrors > 0) {
+
+      reason = 'An external Gmail text part could not be retrieved.';
+
+    } else if (diagnostics.inlineTextParts + diagnostics.externalTextParts === 0) {
+
+      reason = 'The text MIME parts contained no body data.';
+
+    } else if (html.length) {
+
+      reason = 'The HTML body contained no readable visible text.';
+
+    } else {
+
+      reason = 'The text body decoded to empty content.';
+    }
+  }
+
+
+  return {
+    text: text,
+    reason: reason,
+    diagnostics: diagnostics
+  };
 }
 
 
@@ -2771,12 +2853,24 @@ function collectTextParts_(
   part,
   plain,
   html,
-  messageId
+  messageId,
+  diagnostics
 ) {
 
-  if (!part || part.filename || (part.headers || []).some(function(header) {
-    return String(header.name).toLowerCase() === 'content-disposition' && /^attachment/i.test(String(header.value));
-  })) {
+  if (!part) {
+
+    return;
+  }
+
+
+  const isAttachment = Boolean(part.filename) || (part.headers || []).some(function(header) {
+    return String(header.name).toLowerCase() === 'content-disposition' && /^\s*attachment/i.test(String(header.value));
+  });
+
+
+  if (isAttachment) {
+
+    if (diagnostics) diagnostics.skippedAttachments += 1;
     return;
   }
 
@@ -2788,10 +2882,31 @@ function collectTextParts_(
     ).toLowerCase();
 
 
+  const isTextPart =
+    mime === 'text/plain' ||
+    mime === 'text/html';
+
+
+  if (isTextPart && diagnostics) diagnostics.textParts += 1;
+
+
   let data = part.body && part.body.data;
-  if (!data && messageId && part.body && part.body.attachmentId &&
-      (mime === 'text/plain' || mime === 'text/html')) {
-    data = Gmail.Users.Messages.Attachments.get('me', messageId, part.body.attachmentId).data;
+
+
+  if (data && isTextPart && diagnostics) diagnostics.inlineTextParts += 1;
+
+
+  if (!data && messageId && part.body && part.body.attachmentId && isTextPart) {
+
+    try {
+
+      data = Gmail.Users.Messages.Attachments.get('me', messageId, part.body.attachmentId).data;
+      if (data && diagnostics) diagnostics.externalTextParts += 1;
+
+    } catch (ignored) {
+
+      if (diagnostics) diagnostics.externalTextErrors += 1;
+    }
   }
 
 
@@ -2803,12 +2918,13 @@ function collectTextParts_(
     'text/plain'
   ) {
 
-    plain.push(
+    const decodedPlain = decodeBase64UrlUtf8_(data);
 
-      decodeBase64UrlUtf8_(
-        data
-      )
-    );
+
+    if (!decodedPlain.trim() && diagnostics) diagnostics.emptyDecodedParts += 1;
+
+
+    plain.push(decodedPlain);
 
   } else if (
 
@@ -2818,12 +2934,13 @@ function collectTextParts_(
     'text/html'
   ) {
 
-    html.push(
+    const decodedHtml = decodeBase64UrlUtf8_(data);
 
-      decodeBase64UrlUtf8_(
-        data
-      )
-    );
+
+    if (!decodedHtml.trim() && diagnostics) diagnostics.emptyDecodedParts += 1;
+
+
+    html.push(decodedHtml);
   }
 
 
@@ -2843,7 +2960,9 @@ function collectTextParts_(
 
         html,
 
-        messageId
+        messageId,
+
+        diagnostics
       );
     }
   );
@@ -2896,6 +3015,23 @@ function htmlToText_(
     ''
   )
 
+    // Image-heavy newsletters often keep their only readable description in
+    // alt/title attributes. Preserve that text before removing markup.
+    .replace(
+      /<(?:img|area)\b[^>]*\b(?:alt|title)\s*=\s*"([^"]+)"[^>]*>/gi,
+      ' $1 '
+    )
+
+    .replace(
+      /<(?:img|area)\b[^>]*\b(?:alt|title)\s*=\s*'([^']+)'[^>]*>/gi,
+      ' $1 '
+    )
+
+    .replace(
+      /<(?:img|area)\b[^>]*\b(?:alt|title)\s*=\s*([^\s>]+)[^>]*>/gi,
+      ' $1 '
+    )
+
     .replace(
       /<style[\s\S]*?<\/style>/gi,
       ' '
@@ -2907,12 +3043,7 @@ function htmlToText_(
     )
 
     .replace(
-      /<br\s*\/?>/gi,
-      '\n'
-    )
-
-    .replace(
-      /<\/p>/gi,
+      /<\/?(?:br|p|div|li|tr|h[1-6])\b[^>]*>/gi,
       '\n'
     )
 
@@ -2949,6 +3080,36 @@ function htmlToText_(
     .replace(
       /&#39;/gi,
       "'"
+    )
+
+    .replace(
+      /&apos;/gi,
+      "'"
+    )
+
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      function(match, value) {
+        const codePoint = parseInt(value, 16);
+        return Number.isFinite(codePoint) && codePoint > 0 && codePoint <= 0x10FFFF
+          ? String.fromCodePoint(codePoint)
+          : ' ';
+      }
+    )
+
+    .replace(
+      /&#([0-9]+);/g,
+      function(match, value) {
+        const codePoint = parseInt(value, 10);
+        return Number.isFinite(codePoint) && codePoint > 0 && codePoint <= 0x10FFFF
+          ? String.fromCodePoint(codePoint)
+          : ' ';
+      }
+    )
+
+    .replace(
+      /[\u200B-\u200D\uFEFF]/g,
+      ''
     )
 
     .replace(
@@ -6635,6 +6796,9 @@ function getHtml_() {
           metadata_only:
             'Metadata only',
 
+          metadata_fallback:
+            'Safe review fallback',
+
           full:
             'Full-content review',
 
@@ -6667,7 +6831,13 @@ function getHtml_() {
             'Skipped: no readable content',
 
           'skipped-invalid-model-response':
-            'Skipped safely: invalid Jev response'
+            'Skipped safely: invalid Jev response',
+
+          'would apply review fallback':
+            'Preview: safe review fallback',
+
+          'review fallback applied':
+            'Safe review fallback applied'
         };
 
         var tr =
@@ -6679,7 +6849,9 @@ function getHtml_() {
         if (
           [
             'skipped-no-content',
-            'skipped-invalid-model-response'
+            'skipped-invalid-model-response',
+            'would apply review fallback',
+            'review fallback applied'
           ].indexOf(
             row.action
           ) !== -1
