@@ -8,8 +8,8 @@
  * 2) Deploy/Test deployments -> Web app.
  * 3) Open the web app URL and paste an OpenRouter API key.
  *
- * Each email gets its own Decisions request. Independent requests are sent in
- * bounded parallel waves; decisions and every Gmail write are checkpointed.
+ * Each email gets its own Decisions request. Independent requests and Gmail
+ * reads are sent in bounded adaptive waves; completed waves are checkpointed.
  */
 
 
@@ -17,6 +17,9 @@ const APP = Object.freeze({
 
   OPENROUTER_URL:
     'https://openrouter.ai/api/alpha/decisions',
+
+  GMAIL_BATCH_URL:
+    'https://gmail.googleapis.com/batch',
 
   MODEL:
     '~typesafe/jev-latest',
@@ -70,7 +73,33 @@ const APP = Object.freeze({
    * Every email still receives its own independent Jev request.
    */
   BATCH_SIZE:
-    10,
+    50,
+
+
+  /**
+   * Both Gmail and Jev start conservatively and grow only after successful
+   * waves. A rate limit or transient provider failure cuts the window in half.
+   */
+  INITIAL_CONCURRENCY:
+    25,
+
+  MIN_CONCURRENCY:
+    5,
+
+  MAX_CONCURRENCY:
+    50,
+
+  CONCURRENCY_GROWTH:
+    5,
+
+  NETWORK_RETRIES:
+    1,
+
+  GMAIL_RETRY_DELAY_MS:
+    500,
+
+  MAX_GMAIL_RETRY_DELAY_MS:
+    3000,
 
 
   /**
@@ -1380,6 +1409,18 @@ function startTriageJob(
         0,
 
 
+      gmailConcurrency:
+        APP.INITIAL_CONCURRENCY,
+
+
+      jevConcurrency:
+        APP.INITIAL_CONCURRENCY,
+
+
+      gmailRateLimitRetries:
+        0,
+
+
       ruleLabels: rules.map(function(rule) { return {id: rule.id, name: rule.name, spam: rule.spam}; }),
 
       labelCounts:
@@ -1463,8 +1504,8 @@ function startTriageJob(
  * 1) classify every message from metadata;
  * 2) classify only low-confidence messages from full content.
  *
- * Gmail writes remain sequential and checkpointed so a failed write can be
- * resumed without paying for another model decision.
+ * Gmail writes are grouped by final label and remain idempotently resumable,
+ * so a failed write never requires another paid model decision.
  */
 function processNextBatch(jobId, apiKey) {
   return withJobLock_(function() {
@@ -1494,6 +1535,9 @@ function processNextBatch(jobId, apiKey) {
       job.tokenCalculatedCostUsd = Number(job.tokenCalculatedCostUsd || 0);
       job.estimatedCostUsd = Number(job.estimatedCostUsd || 0);
       job.modelRequests = Number(job.modelRequests || 0);
+      job.gmailConcurrency = normalizeConcurrency_(job.gmailConcurrency);
+      job.jevConcurrency = normalizeConcurrency_(job.jevConcurrency);
+      job.gmailRateLimitRetries = Number(job.gmailRateLimitRetries || 0);
 
       if (!job.pending.length) {
         const handled = getJobHandledCount_(job);
@@ -1532,17 +1576,27 @@ function processNextBatch(jobId, apiKey) {
       const metadataById = Object.create(null);
       const pendingSnapshot = job.pending.slice();
 
-      // Fetch metadata once per message. The same object is used for model
-      // input and the result table, avoiding the former second Gmail call.
+      // Gmail's HTTP batch endpoint removes one network round trip per email.
+      // Every inner messages.get still counts against Gmail quota, so the
+      // adaptive window starts at 25 and never exceeds Google's recommended 50.
+      const metadataRead = fetchGmailMessagesAdaptive_(pendingSnapshot.map(function(item) {
+        return item.id;
+      }), 'metadata', job, events);
+
       pendingSnapshot.forEach(function(item) {
-        if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) return;
-        const message = Gmail.Users.Messages.get('me', item.id, {
-          format: 'metadata', metadataHeaders: APP.METADATA_HEADERS
-        });
+        const message = metadataRead.messages[item.id];
+        if (!message) return;
         metadataById[item.id] = normalizeMetadataMessage_(message);
-        if (!job.dryRun && (message.labelIds || []).indexOf(labelContext.technical.id) !== -1) {
+        // A pending item with a final decision may already carry the marker if
+        // an earlier grouped write partly succeeded before its checkpoint.
+        // Keep it and replay the idempotent write so counters can advance.
+        if (!job.dryRun && !item.final &&
+          (message.labelIds || []).indexOf(labelContext.technical.id) !== -1) {
           removePendingItem_(job, item.id);
         }
+      });
+      metadataRead.unavailableIds.forEach(function(id) {
+        skipUnavailableGmailMessage_(job, id, metadataById[id], events, results);
       });
 
       if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
@@ -1589,6 +1643,7 @@ function processNextBatch(jobId, apiKey) {
 
       if (job.status === 'running') {
         const fullRequests = [];
+        const fullItems = [];
 
         job.pending.slice().forEach(function(item) {
           if (item.final || !item.metadataResult) return;
@@ -1610,13 +1665,22 @@ function processNextBatch(jobId, apiKey) {
             return;
           }
 
-          if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
-            job.status = 'paused';
-            job.stopReason = 'runtime-guard';
-            return;
-          }
+          fullItems.push(item);
+        });
 
-          const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
+        const fullRead = fetchGmailMessagesAdaptive_(fullItems.map(function(item) {
+          return item.id;
+        }), 'full', job, events);
+
+        fullRead.unavailableIds.forEach(function(id) {
+          skipUnavailableGmailMessage_(job, id, metadataById[id], events, results);
+        });
+
+        if (job.status === 'running') fullItems.forEach(function(item) {
+          if (!job.pending.some(function(pending) { return pending.id === item.id; })) return;
+          const metadata = metadataById[item.id];
+          const full = fullRead.messages[item.id];
+          if (!full) return;
           const extracted = extractMessageContent_(full);
           const body = compactMessageBody_(extracted.text);
 
@@ -1677,32 +1741,53 @@ function processNextBatch(jobId, apiKey) {
         }
       }
 
-      // Apply only the resolved prefix. An unresolved budget-blocked message
-      // stays at the front so resume preserves inbox order and reuses all
-      // already persisted decisions behind it.
-      while (job.pending.length && job.pending[0].final) {
-        const item = job.pending[0];
+      // Apply the resolved prefix as grouped Gmail writes. If a grouped write
+      // succeeds but the execution stops before the checkpoint, replay is safe:
+      // adding the same label and removing INBOX are idempotent operations.
+      const readyItems = [];
+      for (let i = 0; i < job.pending.length && job.pending[i].final &&
+        metadataById[job.pending[i].id]; i += 1) {
+        readyItems.push(job.pending[i]);
+      }
+      const finalized = readyItems.map(function(item) {
         const decision = item.final;
         const selected = ruleById_(rules, decision.ruleId);
         if (!selected) throw new Error('Jev selected an unknown classification rule.');
-        const final = makeFinalResult_({ref: {id: item.id}}, decision, selected, decision.stage, job);
-        if (!job.dryRun) applyFinalResults_([final], rules, job, labelContext);
+        return makeFinalResult_({ref: {id: item.id}}, decision, selected, decision.stage, job);
+      });
 
-        job.processed += 1;
-        job.labelCounts[selected.id] = Number(job.labelCounts[selected.id] || 0) + 1;
-        if (decision.stage === 'metadata' || decision.stage === 'metadata_fallback') job.metadataOnly += 1;
-        else job.fullBody += 1;
-        if (final.archive && !job.dryRun) job.archived += 1;
-        job.pending.shift();
+      if (finalized.length && !job.dryRun) {
+        const writeOutcome = applyFinalResults_(finalized, rules, job, labelContext);
+        if (!writeOutcome.ok) {
+          if (!writeOutcome.retryable) throw new Error(writeOutcome.error);
+          job.status = 'paused';
+          job.stopReason = 'gmail-temporary';
+          job.lastError = writeOutcome.error;
+          events.push({level: 'warn', message: writeOutcome.error +
+            ' Processing is paused and all decisions are checkpointed. Continue later to retry safely.'});
+        }
+      }
 
-        const metadata = metadataById[item.id] || {headers: {from: '', subject: ''}};
-        results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
-          label: selected.name, confidence: round_(decision.confidence, 3), stage: decision.stage,
-          action: decision.stage === 'metadata_fallback'
-            ? (job.dryRun ? 'would apply review fallback' : 'review fallback applied')
-            : final.archive ? (job.dryRun ? 'would archive' : 'archived')
-              : (job.dryRun ? 'would label' : 'labeled')});
+      if (job.dryRun || job.status !== 'paused' || job.stopReason !== 'gmail-temporary') {
+        readyItems.forEach(function(item, index) {
+          const decision = item.final;
+          const final = finalized[index];
+          const selected = final.rule;
+          job.processed += 1;
+          job.labelCounts[selected.id] = Number(job.labelCounts[selected.id] || 0) + 1;
+          if (decision.stage === 'metadata' || decision.stage === 'metadata_fallback') job.metadataOnly += 1;
+          else job.fullBody += 1;
+          if (final.archive && !job.dryRun) job.archived += 1;
 
+          const metadata = metadataById[item.id] || {headers: {from: '', subject: ''}};
+          results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+            label: selected.name, confidence: round_(decision.confidence, 3), stage: decision.stage,
+            action: decision.stage === 'metadata_fallback'
+              ? (job.dryRun ? 'would apply review fallback' : 'review fallback applied')
+              : final.archive ? (job.dryRun ? 'would archive' : 'archived')
+                : (job.dryRun ? 'would label' : 'labeled')});
+        });
+        if (readyItems.length) job.pending.splice(0, readyItems.length);
         job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
         saveJob_(job);
       }
@@ -1807,7 +1892,7 @@ function accountJevRequestCost_(job, request, parsed) {
 function dispatchJevWave_(requests, apiKey, rules, job, events) {
   let budgetBlocked = false;
 
-  const dispatch = function(candidates) {
+  const dispatch = function(candidates, isRetry) {
     const selected = [];
     let reserve = 0;
 
@@ -1826,6 +1911,7 @@ function dispatchJevWave_(requests, apiKey, rules, job, events) {
 
     job.spentUsd = Number(job.spentUsd || 0) + reserve;
     job.modelRequests = Number(job.modelRequests || 0) + selected.length;
+    if (isRetry) job.providerRetries = Number(job.providerRetries || 0) + selected.length;
     saveJob_(job);
 
     const parsed = callJevParallel_(selected, apiKey, rules);
@@ -1837,57 +1923,94 @@ function dispatchJevWave_(requests, apiKey, rules, job, events) {
     return selected;
   };
 
-  const firstAttempt = dispatch(requests);
-  let retryable = firstAttempt.filter(function(request) {
-    return request.result && !request.result.ok && request.result.retryable;
-  });
-
-  if (retryable.length) {
-    const isBatchTransportFailure = retryable.length === firstAttempt.length && retryable.every(function(request) {
-      return request.result.failureScope === 'session' && request.result.code === retryable[0].result.code;
+  const retryInAdaptiveChunks = function(candidates, message) {
+    if (!candidates.length) return true;
+    let retryAfterMs = APP.JEV_RETRY_DELAY_MS;
+    candidates.forEach(function(request) {
+      retryAfterMs = Math.max(retryAfterMs, Number(request.result && request.result.retryAfterMs) || 0);
     });
+    events.push({level: 'warn', message: message});
+    Utilities.sleep(Math.min(APP.MAX_JEV_RETRY_DELAY_MS, retryAfterMs));
 
-    // For a batch-wide transport outage, probe one request first. If the
-    // provider is still unavailable, do not spend credits retrying the rest.
-    const probe = isBatchTransportFailure ? retryable.slice(0, 1) : [];
-    if (probe.length) {
-      const firstFailure = probe[0].result;
-      events.push({level: 'warn', message:
-        'Jev response validation failed (' + firstFailure.code + '): ' + firstFailure.error +
-        ' Retrying once.'});
-      probe[0].result = null;
-      job.providerRetries = Number(job.providerRetries || 0) + 1;
-      saveJob_(job);
-      Utilities.sleep(Math.min(APP.MAX_JEV_RETRY_DELAY_MS,
-        Math.max(APP.JEV_RETRY_DELAY_MS, Number(firstFailure.retryAfterMs) || 0)));
-      dispatch(probe);
+    for (let offset = 0; offset < candidates.length;) {
+      const size = Math.min(normalizeConcurrency_(job.jevConcurrency), candidates.length - offset);
+      const chunk = candidates.slice(offset, offset + size);
+      chunk.forEach(function(request) { request.result = null; });
+      const sent = dispatch(chunk, true);
+      if (sent.length < chunk.length) return false;
+      offset += sent.length;
+      if (sent.some(function(request) {
+        return request.result && !request.result.ok && request.result.failureScope === 'session';
+      })) return false;
+    }
+    return true;
+  };
 
-      if (!probe[0].result || !probe[0].result.ok) {
-        return {budgetBlocked: budgetBlocked};
-      }
-      retryable = retryable.slice(1);
-    } else {
-      // Retrying more invalid message responses than the circuit breaker can
-      // consume would spend credits without allowing any additional progress.
-      retryable = retryable.slice(0, Math.max(1,
-        APP.MAX_CONSECUTIVE_JEV_FAILURES - Number(job.consecutiveJevFailures || 0)));
+  const attempted = [];
+  let cursor = 0;
+  while (cursor < requests.length) {
+    const size = Math.min(normalizeConcurrency_(job.jevConcurrency), requests.length - cursor);
+    const candidates = requests.slice(cursor, cursor + size);
+    const sent = dispatch(candidates, false);
+    attempted.push.apply(attempted, sent);
+    cursor += sent.length;
+    if (sent.length < candidates.length) break;
+
+    const sessionFailures = sent.filter(function(request) {
+      return request.result && !request.result.ok && request.result.failureScope === 'session';
+    });
+    if (!sessionFailures.length) {
+      growConcurrency_(job, 'jevConcurrency');
+      continue;
     }
 
-    if (!retryable.length) return {budgetBlocked: budgetBlocked};
+    const retryableSession = sessionFailures.filter(function(request) {
+      return request.result.retryable;
+    });
+    if (!retryableSession.length) break;
 
-    let retryAfterMs = APP.JEV_RETRY_DELAY_MS;
-    retryable.forEach(function(request) {
-      retryAfterMs = Math.max(retryAfterMs, Number(request.result.retryAfterMs) || 0);
-      events.push({level: 'warn', message:
-        'Jev response validation failed (' + request.result.code + '): ' + request.result.error +
-        ' Retrying once.'});
-      request.result = null;
+    reduceConcurrency_(job, 'jevConcurrency');
+    const allFailedTogether = retryableSession.length === sent.length && retryableSession.every(function(request) {
+      return request.result.code === retryableSession[0].result.code;
     });
 
-    job.providerRetries = Number(job.providerRetries || 0) + retryable.length;
-    saveJob_(job);
-    Utilities.sleep(Math.min(APP.MAX_JEV_RETRY_DELAY_MS, retryAfterMs));
-    dispatch(retryable);
+    if (allFailedTogether) {
+      // Probe one request before retrying the remainder. This avoids duplicating
+      // a whole paid wave during a persistent provider outage.
+      const probe = retryableSession.slice(0, 1);
+      if (!retryInAdaptiveChunks(probe,
+        'Jev is temporarily unavailable. Retrying one request with reduced concurrency ' +
+        job.jevConcurrency + '.')) break;
+      if (!probe[0].result || !probe[0].result.ok) break;
+      if (!retryInAdaptiveChunks(retryableSession.slice(1),
+        'The Jev probe succeeded. Retrying the remaining ' + (retryableSession.length - 1) +
+        ' request(s) once.')) break;
+    } else if (!retryInAdaptiveChunks(retryableSession,
+      'Jev temporarily limited ' + retryableSession.length + ' request(s). Retrying once with concurrency ' +
+      job.jevConcurrency + '.')) {
+      break;
+    }
+
+    const persistent = retryableSession.some(function(request) {
+      return !request.result || !request.result.ok;
+    });
+    if (persistent) break;
+  }
+
+  // Contract-validation errors are message-scoped. Retry only as many as the
+  // circuit breaker can safely consume instead of paying to retry an entire
+  // large wave that cannot make further progress.
+  let invalid = attempted.filter(function(request) {
+    return request.result && !request.result.ok && request.result.retryable &&
+      request.result.failureScope !== 'session';
+  });
+  invalid = invalid.slice(0, Math.max(1,
+    APP.MAX_CONSECUTIVE_JEV_FAILURES - Number(job.consecutiveJevFailures || 0)));
+  if (invalid.length) {
+    const firstInvalidCode = invalid[0].result.code;
+    retryInAdaptiveChunks(invalid,
+      'Jev response validation failed (' + firstInvalidCode + ') for ' + invalid.length +
+      ' response' + (invalid.length === 1 ? '' : 's') + '. Retrying once.');
   }
 
   return {budgetBlocked: budgetBlocked};
@@ -1916,7 +2039,6 @@ function skipUnreadableMessage_(job, item, metadata, reason, events, results) {
   results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
     label: 'Not assigned', confidence: '', stage: 'metadata', action: 'skipped-no-content'});
   job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
-  saveJob_(job);
 }
 
 
@@ -1931,7 +2053,6 @@ function handleParallelJevFailure_(job, item, metadata, stage, parsed, events, r
     job.lastError = parsed.error;
     events.push({level: 'warn', message:
       parsed.error + ' Processing is paused; select Continue processing to try again later.'});
-    saveJob_(job);
     return;
   }
 
@@ -1943,7 +2064,6 @@ function handleParallelJevFailure_(job, item, metadata, stage, parsed, events, r
       ' consecutive messages. Processing was paused to protect the remaining API budget. Last issue: ' + parsed.error;
     events.push({level: 'warn', message: job.lastError +
       ' No Gmail changes were made to the current message. Continue later when the provider is stable.'});
-    saveJob_(job);
     return;
   }
 
@@ -1965,7 +2085,6 @@ function handleParallelJevFailure_(job, item, metadata, stage, parsed, events, r
   results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
     label: 'Not assigned', confidence: '', stage: stage, action: 'skipped-invalid-model-response'});
   job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
-  saveJob_(job);
 }
 
 
@@ -2407,6 +2526,265 @@ function buildGmailQuery_(
 
 
 /* =====================================================================
+ * ADAPTIVE GMAIL BATCH I/O
+ * ===================================================================== */
+
+
+function normalizeConcurrency_(value) {
+  const parsed = Math.floor(Number(value) || APP.INITIAL_CONCURRENCY);
+  return Math.max(APP.MIN_CONCURRENCY, Math.min(APP.MAX_CONCURRENCY, parsed));
+}
+
+
+function growConcurrency_(job, key) {
+  job[key] = Math.min(APP.MAX_CONCURRENCY,
+    normalizeConcurrency_(job[key]) + APP.CONCURRENCY_GROWTH);
+}
+
+
+function reduceConcurrency_(job, key) {
+  job[key] = Math.max(APP.MIN_CONCURRENCY,
+    Math.floor(normalizeConcurrency_(job[key]) / 2));
+}
+
+
+function httpHeaderValue_(headers, name) {
+  const expected = String(name || '').toLowerCase();
+  const source = headers || {};
+  const key = Object.keys(source).filter(function(candidate) {
+    return String(candidate).toLowerCase() === expected;
+  })[0];
+  const value = key ? source[key] : '';
+  return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+}
+
+
+function retryAfterMsFromHeaders_(headers, maximum) {
+  const raw = httpHeaderValue_(headers, 'retry-after').trim();
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(maximum, seconds * 1000);
+  }
+  const retryDate = Date.parse(raw);
+  if (Number.isFinite(retryDate)) {
+    return Math.min(maximum, Math.max(0, retryDate - Date.now()));
+  }
+  return 0;
+}
+
+
+function isTransientHttpStatus_(status) {
+  return status === 0 || [408, 409, 425, 429].indexOf(status) !== -1 || status >= 500;
+}
+
+
+function isGmailRateLimitResponse_(status, body) {
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  return /(?:rateLimitExceeded|userRateLimitExceeded|dailyLimitExceeded|quota|rate.?limit)/i.test(
+    String(body || '')
+  );
+}
+
+
+/**
+ * Read Gmail messages through multipart/mixed HTTP batches. Successful parts
+ * are retained when another part is throttled; only failed IDs are retried.
+ */
+function fetchGmailMessagesAdaptive_(ids, format, job, events) {
+  const output = {messages: Object.create(null), unavailableIds: []};
+  if (!ids.length || job.status !== 'running') return output;
+
+  let queue = ids.map(function(id) { return {id: id, attempt: 0}; });
+
+  while (queue.length && job.status === 'running') {
+    const windowSize = Math.min(normalizeConcurrency_(job.gmailConcurrency), queue.length);
+    const entries = queue.splice(0, windowSize);
+    const batch = callGmailHttpBatch_(entries.map(function(entry) { return entry.id; }), format);
+    const retry = [];
+    const exhausted = [];
+    let retryAfterMs = APP.GMAIL_RETRY_DELAY_MS;
+    let adaptiveFailure = false;
+
+    entries.forEach(function(entry, index) {
+      const part = batch[index] || {ok: false, status: 0, retryable: true,
+        error: 'Gmail returned an incomplete batch response.'};
+      if (part.ok) {
+        output.messages[entry.id] = part.message;
+        return;
+      }
+      if (part.status === 404) {
+        output.unavailableIds.push(entry.id);
+        return;
+      }
+      if (part.authFailure) {
+        throw new Error('Gmail authorization failed while reading messages. Reauthorize the Apps Script deployment and try again.');
+      }
+      if (!part.retryable) {
+        throw new Error(part.error || ('Gmail rejected a message read with HTTP ' + part.status + '.'));
+      }
+
+      adaptiveFailure = true;
+      retryAfterMs = Math.max(retryAfterMs, Number(part.retryAfterMs) || 0);
+      if (entry.attempt < APP.NETWORK_RETRIES) retry.push({id: entry.id, attempt: entry.attempt + 1});
+      else exhausted.push(entry.id);
+    });
+
+    if (adaptiveFailure) {
+      reduceConcurrency_(job, 'gmailConcurrency');
+      job.gmailRateLimitRetries = Number(job.gmailRateLimitRetries || 0) + retry.length;
+      if (exhausted.length) {
+        job.status = 'paused';
+        job.stopReason = 'gmail-temporary';
+        job.lastError = 'Gmail is temporarily rate-limiting or unavailable. No new Gmail changes were made.';
+        events.push({level: 'warn', message: job.lastError +
+          ' Processing is paused and can be continued safely after a short wait.'});
+        break;
+      }
+      if (retry.length) {
+        events.push({level: 'warn', message:
+          'Gmail temporarily limited ' + retry.length + ' message read' +
+          (retry.length === 1 ? '' : 's') + '. Retrying once with concurrency ' +
+          job.gmailConcurrency + '.'});
+        saveJob_(job);
+        Utilities.sleep(Math.min(APP.MAX_GMAIL_RETRY_DELAY_MS, retryAfterMs));
+        queue = retry.concat(queue);
+      }
+    } else {
+      growConcurrency_(job, 'gmailConcurrency');
+    }
+
+    if (Date.now() - Number(job.activeStartedAt || Date.now()) > APP.SERVER_CALL_RUNTIME_MS) {
+      job.status = 'paused';
+      job.stopReason = 'runtime-guard';
+    }
+  }
+
+  return output;
+}
+
+
+/**
+ * Execute one Gmail multipart batch. The response is mapped by Content-ID so
+ * server-side reordering cannot attach one email's data to another ID.
+ */
+function callGmailHttpBatch_(ids, format) {
+  if (!ids.length) return [];
+  const boundary = 'jevmail_' + Utilities.getUuid().replace(/[^A-Za-z0-9_-]/g, '');
+  const headersQuery = APP.METADATA_HEADERS.map(function(header) {
+    return 'metadataHeaders=' + encodeURIComponent(header);
+  }).join('&');
+  const parts = ids.map(function(id, index) {
+    let path = '/gmail/v1/users/me/messages/' + encodeURIComponent(id) + '?format=' +
+      encodeURIComponent(format);
+    if (format === 'metadata' && headersQuery) path += '&' + headersQuery;
+    return '--' + boundary + '\r\n' +
+      'Content-Type: application/http\r\n' +
+      'Content-ID: <item-' + index + '>\r\n\r\n' +
+      'GET ' + path + ' HTTP/1.1\r\n\r\n';
+  });
+  const payload = parts.join('') + '--' + boundary + '--\r\n';
+  let response;
+
+  try {
+    response = UrlFetchApp.fetch(APP.GMAIL_BATCH_URL, {
+      method: 'post',
+      contentType: 'multipart/mixed; boundary=' + boundary,
+      headers: {Authorization: 'Bearer ' + ScriptApp.getOAuthToken()},
+      payload: payload,
+      muteHttpExceptions: true
+    });
+  } catch (error) {
+    return ids.map(function() {
+      return {ok: false, status: 0, retryable: true, retryAfterMs: 0,
+        error: 'Gmail could not be reached. Technical detail: ' + String(error && error.message || error)};
+    });
+  }
+
+  const outerStatus = response.getResponseCode();
+  const outerHeaders = response.getAllHeaders ? response.getAllHeaders() :
+    (response.getHeaders ? response.getHeaders() : {});
+  const responseText = response.getContentText();
+  if (outerStatus < 200 || outerStatus >= 300) {
+    const rateLimited = isGmailRateLimitResponse_(outerStatus, responseText);
+    return ids.map(function() {
+      return {ok: false, status: outerStatus,
+        retryable: rateLimited || isTransientHttpStatus_(outerStatus),
+        authFailure: outerStatus === 401 || (outerStatus === 403 && !rateLimited),
+        retryAfterMs: retryAfterMsFromHeaders_(outerHeaders, APP.MAX_GMAIL_RETRY_DELAY_MS),
+        error: 'Gmail batch request returned HTTP ' + outerStatus + '.'};
+    });
+  }
+
+  const contentType = httpHeaderValue_(outerHeaders, 'content-type');
+  const match = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  if (!match) {
+    return ids.map(function() {
+      return {ok: false, status: 502, retryable: true, retryAfterMs: 0,
+        error: 'Gmail returned a batch response without a multipart boundary.'};
+    });
+  }
+
+  const responseBoundary = match[1] || match[2];
+  const parsed = new Array(ids.length);
+  let fallbackIndex = 0;
+  responseText.split('--' + responseBoundary).forEach(function(part) {
+    const http = /HTTP\/1\.[01]\s+(\d{3})[^\r\n]*\r?\n([\s\S]*?)\r?\n\r?\n([\s\S]*)/.exec(part);
+    if (!http) return;
+    const contentId = /Content-ID:\s*<response-item-(\d+)>/i.exec(part);
+    const index = contentId ? Number(contentId[1]) : fallbackIndex;
+    fallbackIndex += 1;
+    if (!Number.isInteger(index) || index < 0 || index >= ids.length) return;
+    const status = Number(http[1]);
+    const innerHeaders = {};
+    String(http[2] || '').split(/\r?\n/).forEach(function(line) {
+      const separator = line.indexOf(':');
+      if (separator > 0) innerHeaders[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+    });
+    const body = String(http[3] || '').replace(/\r?\n$/, '').trim();
+    if (status >= 200 && status < 300) {
+      try {
+        parsed[index] = {ok: true, status: status, message: JSON.parse(body)};
+      } catch (ignored) {
+        parsed[index] = {ok: false, status: 502, retryable: true, retryAfterMs: 0,
+          error: 'Gmail returned invalid JSON for one message.'};
+      }
+    } else {
+      const rateLimited = isGmailRateLimitResponse_(status, body);
+      parsed[index] = {ok: false, status: status,
+        retryable: rateLimited || isTransientHttpStatus_(status),
+        authFailure: status === 401 || (status === 403 && !rateLimited),
+        retryAfterMs: retryAfterMsFromHeaders_(innerHeaders, APP.MAX_GMAIL_RETRY_DELAY_MS),
+        error: 'Gmail returned HTTP ' + status + ' for one message.'};
+    }
+  });
+
+  return parsed.map(function(part) {
+    return part || {ok: false, status: 502, retryable: true, retryAfterMs: 0,
+      error: 'Gmail omitted one message from its batch response.'};
+  });
+}
+
+
+function skipUnavailableGmailMessage_(job, id, metadata, events, results) {
+  if (job.skippedMessageIds.indexOf(id) === -1) {
+    if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
+      throw new Error('Too many messages were skipped safely in this session. Start a new session with a narrower Gmail scope.');
+    }
+    job.skippedMessageIds.push(id);
+  }
+  job.skipped += 1;
+  removePendingItem_(job, id);
+  const safeMetadata = metadata || {headers: {from: '', subject: ''}};
+  events.push({level: 'warn', message:
+    'A selected Gmail message is no longer available. It was skipped without applying labels or archive actions.'});
+  results.push({from: safeMetadata.headers.from || '', subject: safeMetadata.headers.subject || '',
+    label: 'Not assigned', confidence: '', stage: 'metadata', action: 'skipped-message-unavailable'});
+  job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
+}
+
+
+/* =====================================================================
  * GMAIL LABEL HELPERS
  * ===================================================================== */
 
@@ -2595,6 +2973,8 @@ function applyFinalResults_(
   labelContext
 ) {
 
+  let outcome = {ok: true};
+
   const byName =
     labelContext ? labelContext.byName : ensureGmailLabels_(
       rules
@@ -2669,6 +3049,8 @@ function applyFinalResults_(
       ruleId
     ) {
 
+      if (!outcome.ok) return;
+
       const group =
         groups[
           ruleId
@@ -2690,7 +3072,7 @@ function applyFinalResults_(
         group.labelIds.length
       ) {
 
-        Gmail.Users.Messages.batchModify(
+        outcome = executeGmailBatchModify_(
 
           {
 
@@ -2704,10 +3086,10 @@ function applyFinalResults_(
 
               technical.id
             ]
-          },
-
-          'me'
+          }
         );
+
+        if (!outcome.ok) return;
       }
 
 
@@ -2720,7 +3102,7 @@ function applyFinalResults_(
         group.archiveIds.length
       ) {
 
-        Gmail.Users.Messages.batchModify(
+        outcome = executeGmailBatchModify_(
 
           {
 
@@ -2739,13 +3121,44 @@ function applyFinalResults_(
             removeLabelIds: [
               'INBOX'
             ]
-          },
-
-          'me'
+          }
         );
       }
     }
   );
+
+
+  return outcome;
+}
+
+
+/**
+ * Gmail label writes are idempotent, so one bounded retry is safe. A caller
+ * keeps every final decision checkpointed until all grouped writes succeed.
+ */
+function executeGmailBatchModify_(request) {
+  let lastError;
+  for (let attempt = 0; attempt <= APP.NETWORK_RETRIES; attempt += 1) {
+    try {
+      Gmail.Users.Messages.batchModify(request, 'me');
+      return {ok: true};
+    } catch (error) {
+      lastError = error;
+      const detail = String(error && error.message || error);
+      const retryable = /(?:429|rate.?limit|too many times|backend.?error|timeout|timed out|temporar|unavailable|\b5\d\d\b)/i.test(detail);
+      if (!retryable) {
+        return {ok: false, retryable: false,
+          error: 'Gmail rejected a grouped label update. No decision checkpoint was removed. Technical detail: ' + detail};
+      }
+      if (attempt < APP.NETWORK_RETRIES) {
+        Utilities.sleep(Math.min(APP.MAX_GMAIL_RETRY_DELAY_MS,
+          APP.GMAIL_RETRY_DELAY_MS * Math.pow(2, attempt)));
+      }
+    }
+  }
+  return {ok: false, retryable: true,
+    error: 'Gmail is temporarily rate-limiting or unavailable. The grouped label update will be retried on resume. Technical detail: ' +
+      String(lastError && lastError.message || lastError)};
 }
 
 
@@ -3860,6 +4273,9 @@ function callJevParallel_(
           failureScope:
             'session',
 
+          httpStatus:
+            0,
+
           retryAfterMs:
             0,
 
@@ -4012,7 +4428,12 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
     })[0];
     const rawRetry = retryHeader ? headers[retryHeader] : '';
     const retrySeconds = Number(Array.isArray(rawRetry) ? rawRetry[0] : rawRetry);
-    if (Number.isFinite(retrySeconds) && retrySeconds >= 0) retryAfterMs = retrySeconds * 1000;
+    if (Number.isFinite(retrySeconds) && retrySeconds >= 0) {
+      retryAfterMs = retrySeconds * 1000;
+    } else {
+      const retryDate = Date.parse(String(Array.isArray(rawRetry) ? rawRetry[0] : rawRetry || ''));
+      if (Number.isFinite(retryDate)) retryAfterMs = Math.max(0, retryDate - Date.now());
+    }
   } catch (ignored) {}
   const estimated = Math.max(0, Number(fallbackEstimatedCost) || 0);
   let json;
@@ -4126,15 +4547,17 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
         missingCount: 0, unexpectedCount: unexpectedKeys.length}});
   }
   let total = 0;
+  let maximumKey = '';
+  let maximumProbability = -1;
   for (let i = 0; i < rules.length; i++) {
     const p = probabilities['L' + i];
     if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) {
       return failure('invalid_probability_value',
         'Jev returned an invalid class probability. No Gmail changes were made.');
     }
-    if (p > probabilities[choice] + 0.000001) {
-      return failure('choice_probability_mismatch',
-        'Jev selected a class that does not have the highest probability. No Gmail changes were made.');
+    if (p > maximumProbability) {
+      maximumProbability = p;
+      maximumKey = 'L' + i;
     }
     total += p;
   }
@@ -4146,6 +4569,7 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
         probabilitySum: round_(total, 6)}});
   }
   return {ok: true, ruleId: rule.id, confidence: confidence, probabilities: probabilities,
+    probabilityArgmax: maximumKey, choiceDiffersFromArgmax: maximumKey !== choice,
     costUsd: cost, costSource: costSource, inputTokens: hasInputTokens ? inputTokens : 0,
     model: json.model || APP.MODEL, provider: json.provider || ''};
 }
@@ -4560,6 +4984,10 @@ function sanitizeJobForUi_(
         job.providerRetries ||
         0
       ),
+
+
+    gmailRateLimitRetries:
+      Number(job.gmailRateLimitRetries || 0),
 
 
     modelResponseSkips:
@@ -5541,7 +5969,7 @@ function getHtml_() {
       <div class="stat">
 
         <span>
-          Model retries
+          Automatic retries
         </span>
 
         <b id="sRetries">
@@ -7757,9 +8185,13 @@ function getHtml_() {
     };
 
 
+    var automaticRetries =
+      Number(j.providerRetries || 0) + Number(j.gmailRateLimitRetries || 0);
+
+
     var hasWarnings =
       skipped > 0 ||
-      Number(j.providerRetries || 0) > 0 ||
+      automaticRetries > 0 ||
       Number(j.failed || 0) > 0;
 
 
@@ -7889,8 +8321,7 @@ function getHtml_() {
     el(
       'sRetries'
     ).textContent =
-      j.providerRetries ||
-      0;
+      automaticRetries;
 
 
     el(
@@ -8132,7 +8563,15 @@ function getHtml_() {
       'paused'
     ) {
 
-      if (
+      if (j.stopReason === 'gmail-temporary') {
+
+        setStatus(
+          (j.lastError || 'Gmail is temporarily rate-limiting requests.') +
+            ' Completed decisions are saved. Select Continue processing after a short wait.',
+          'warn'
+        );
+
+      } else if (
         j.stopReason === 'provider-temporary' ||
         j.stopReason === 'jev-response-circuit-breaker'
       ) {
@@ -8168,11 +8607,21 @@ function getHtml_() {
 
       if (hasWarnings) {
 
+        var warningParts = [];
+        if (automaticRetries > 0) {
+          warningParts.push(
+            automaticRetries + (automaticRetries === 1 ? ' automatic retry' : ' automatic retries')
+          );
+        }
+        if (skipped > 0) {
+          warningParts.push(
+            skipped + ' safely skipped message' + (skipped === 1 ? '' : 's')
+          );
+        }
+
         setStatus(
-          'Processing continues safely after ' + Number(j.providerRetries || 0) +
-            (Number(j.providerRetries || 0) === 1 ? ' model retry' : ' model retries') +
-            ' and ' + skipped + ' skipped message' + (skipped === 1 ? '' : 's') +
-            '. Skipped messages remain unchanged in Gmail.',
+          'Processing continues safely after ' + warningParts.join(' and ') + '.' +
+            (skipped > 0 ? ' Skipped messages remain unchanged in Gmail.' : ''),
           'warn'
         );
 

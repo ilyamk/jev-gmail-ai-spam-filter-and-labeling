@@ -9,7 +9,8 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'CODE.gs'), 'utf8');
 
 function fixture(count = 3, settings = {}) {
   const data = new Map();
-  const calls = {model: 0, writes: [], full: 0, fetchAll: 0, propertyWrites: 0};
+  const calls = {model: 0, writes: [], writeAttempts: 0, full: 0, fetchAll: 0,
+    gmailBatches: 0, gmailBatchItems: [], propertyWrites: 0};
   let serial = 0, locked = false, clock = 1000;
   const labels = [];
   const messages = Array.from({length: count}, (_, i) => ({id: String(i + 1), labelIds: ['INBOX']}));
@@ -63,7 +64,12 @@ function fixture(count = 3, settings = {}) {
             body: {data: emptyBody ? '' : Buffer.from('Please approve the requested change.').toString('base64url')}}};
         },
         batchModify(request) {
+          calls.writeAttempts++;
           if (settings.failWrite) {settings.failWrite = false; throw new Error('Temporary Gmail write failure');}
+          if (settings.failWritesPersistently) throw new Error('429 Gmail rate limit exceeded');
+          if (settings.failWritesFromAttempt && calls.writeAttempts >= settings.failWritesFromAttempt) {
+            throw new Error('429 Gmail rate limit exceeded');
+          }
           calls.writes.push(request);
           for (const id of request.ids) {
             const m = messages.find(m => m.id === id);
@@ -72,7 +78,45 @@ function fixture(count = 3, settings = {}) {
         }
       }
     }},
+    ScriptApp: {getOAuthToken: () => 'gmail-oauth-token'},
     UrlFetchApp: {
+      fetch(url, request) {
+        if (url === 'https://gmail.googleapis.com/batch') {
+          calls.gmailBatches++;
+          assert.equal(request.headers.Authorization, 'Bearer gmail-oauth-token');
+          const entries = [...String(request.payload).matchAll(
+            /Content-ID:\s*<item-(\d+)>[\s\S]*?GET\s+([^\s]+)\s+HTTP\/1\.1/g
+          )].map(match => {
+            const parsed = new URL('https://gmail.googleapis.com' + match[2]);
+            const pieces = parsed.pathname.split('/');
+            return {index: Number(match[1]), id: decodeURIComponent(pieces[pieces.length - 1]),
+              format: parsed.searchParams.get('format')};
+          });
+          calls.gmailBatchItems.push(entries.map(entry => ({id: entry.id, format: entry.format})));
+          const outerStatus = settings.gmailOuterStatuses && settings.gmailOuterStatuses[calls.gmailBatches - 1];
+          if (outerStatus) return textResponse('', outerStatus, {'Content-Type': 'application/json', 'Retry-After': '0'});
+
+          const responseBoundary = 'response_' + calls.gmailBatches;
+          const ordered = settings.reverseGmailBatchResponses ? entries.slice().reverse() : entries;
+          const parts = ordered.map(entry => {
+            let part = settings.gmailPartResponder && settings.gmailPartResponder({
+              id: entry.id, format: entry.format, batchCall: calls.gmailBatches, index: entry.index
+            });
+            if (!part) part = {status: 200, message: ctx.Gmail.Users.Messages.get('me', entry.id, {format: entry.format})};
+            const status = part.status || 200;
+            const body = part.body || (part.message ? JSON.stringify(part.message) : JSON.stringify({error: {code: status}}));
+            return '--' + responseBoundary + '\r\nContent-Type: application/http\r\n' +
+              'Content-ID: <response-item-' + entry.index + '>\r\n\r\n' +
+              'HTTP/1.1 ' + status + ' ' + (status === 200 ? 'OK' : 'Error') + '\r\n' +
+              'Content-Type: application/json\r\n' +
+              (part.retryAfter !== undefined ? 'Retry-After: ' + part.retryAfter + '\r\n' : '') +
+              '\r\n' + body + '\r\n';
+          });
+          return textResponse(parts.join('') + '--' + responseBoundary + '--\r\n', 200,
+            {'Content-Type': 'multipart/mixed; boundary="' + responseBoundary + '"'});
+        }
+        throw new Error('Unexpected UrlFetchApp.fetch URL: ' + url);
+      },
       fetchAll(requests) {
         calls.fetchAll++;
         return requests.map(request => {
@@ -99,7 +143,12 @@ function fixture(count = 3, settings = {}) {
 }
 
 function response(json, status = 200) {
-  return {getResponseCode: () => status, getContentText: () => JSON.stringify(json)};
+  return textResponse(JSON.stringify(json), status, {});
+}
+
+function textResponse(text, status = 200, headers = {}) {
+  return {getResponseCode: () => status, getContentText: () => text,
+    getHeaders: () => headers, getAllHeaders: () => headers};
 }
 
 test('unsaved API key processes without persisting it; preview never writes Gmail', () => {
@@ -121,18 +170,18 @@ test('numeric limit follows actual pages rather than the approximate total', () 
   assert.equal(job.processed, 10); assert.equal(job.status, 'completed');
 });
 
-test('write failure resumes a persisted decision without another paid request', () => {
+test('a transient grouped Gmail write retries without another paid request', () => {
   const f = fixture(1, {dryRun: false, failWrite: true}); let job = f.start();
-  job = f.batch(job.id).job; assert.equal(job.status, 'error'); assert.equal(f.calls.model, 1);
-  f.ctx.resumeTriageJob(job.id); job = f.batch(job.id).job;
-  assert.equal(job.processed, 1); assert.equal(f.calls.model, 1); assert.equal(f.calls.writes.length, 1);
+  job = f.batch(job.id).job;
+  assert.equal(job.processed, 1); assert.equal(f.calls.model, 1);
+  assert.equal(f.calls.writeAttempts, 2); assert.equal(f.calls.writes.length, 1);
 });
 
 test('a transient model transport failure retries once and continues the batch', () => {
   const f = fixture(10, {failModelAt: 2}); let job = f.start();
   let batch = f.batch(job.id); job = batch.job;
   assert.equal(job.processed, 10); assert.equal(job.status, 'completed'); assert.equal(job.providerRetries, 10);
-  assert.ok(batch.events.some(event => /Retrying once/.test(event.message)));
+  assert.ok(batch.events.some(event => /temporarily unavailable|Retrying/i.test(event.message)));
   assert.equal(f.calls.model, 12); assert.equal(f.calls.fetchAll, 3);
 });
 
@@ -145,6 +194,89 @@ test('ten metadata decisions are sent in one parallel HTTP wave', () => {
   assert.ok(f.calls.propertyWrites - writesBeforeBatch <= 16);
 });
 
+test('fifty messages use adaptive Gmail and Jev waves in one browser iteration', () => {
+  const f = fixture(50); const started = f.start(); const writesBeforeBatch = f.calls.propertyWrites;
+  const job = f.batch(started.id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 50);
+  assert.deepEqual(f.calls.gmailBatchItems.map(batch => batch.length), [25, 25]);
+  assert.equal(f.calls.fetchAll, 2); assert.equal(f.calls.model, 50);
+  assert.ok(f.calls.propertyWrites - writesBeforeBatch <= 14);
+  const stored = f.ctx.loadJob_();
+  assert.equal(stored.gmailConcurrency, 35); assert.equal(stored.jevConcurrency, 35);
+});
+
+test('Gmail multipart responses are mapped by Content-ID even when reordered', () => {
+  const subjects = [];
+  const f = fixture(8, {reverseGmailBatchResponses: true, modelResponder({payload}) {
+    subjects.push(payload.state.email.subject);
+    return response({answers: {label: {choice: 'L0', confidence: 1, probabilities: {L0: 1}}}});
+  }});
+  const job = f.batch(f.start().id).job;
+  assert.equal(job.status, 'completed');
+  assert.deepEqual(subjects.sort(), Array.from({length: 8}, (_, i) => 'Message ' + (i + 1)).sort());
+});
+
+test('a partial Gmail 429 retries only the affected message with lower concurrency', () => {
+  const f = fixture(10, {gmailPartResponder({id, format, batchCall}) {
+    if (format === 'metadata' && id === '3' && batchCall === 1) return {status: 429, retryAfter: 0};
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed'); assert.equal(batch.job.processed, 10);
+  assert.deepEqual(f.calls.gmailBatchItems.map(items => items.length), [10, 1]);
+  assert.equal(f.ctx.loadJob_().gmailRateLimitRetries, 1);
+  assert.ok(batch.events.some(event => /Gmail temporarily limited 1 message read/.test(event.message)));
+});
+
+test('Gmail userRateLimitExceeded 403 is treated as throttling, not lost authorization', () => {
+  const f = fixture(4, {gmailPartResponder({id, format, batchCall}) {
+    if (format === 'metadata' && id === '2' && batchCall === 1) {
+      return {status: 403, body: JSON.stringify({error: {errors: [{reason: 'userRateLimitExceeded'}]}})};
+    }
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed'); assert.equal(batch.job.processed, 4);
+  assert.equal(f.ctx.loadJob_().gmailRateLimitRetries, 1);
+  assert.equal(f.calls.model, 4);
+});
+
+test('an outer Gmail batch 429 retries the bounded wave once', () => {
+  const f = fixture(10, {gmailOuterStatuses: [429]});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed'); assert.equal(batch.job.processed, 10);
+  assert.deepEqual(f.calls.gmailBatchItems.map(items => items.length), [10, 10]);
+  assert.equal(f.calls.model, 10);
+});
+
+test('a persistent Gmail 429 pauses safely before any paid model request', () => {
+  const f = fixture(10, {gmailPartResponder({id, format}) {
+    if (format === 'metadata' && id === '1') return {status: 429, retryAfter: 0};
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'paused'); assert.equal(batch.job.stopReason, 'gmail-temporary');
+  assert.equal(batch.job.processed, 0); assert.equal(f.calls.model, 0);
+  assert.deepEqual(f.calls.gmailBatchItems.map(items => items.length), [10, 1]);
+});
+
+test('a partial OpenRouter 429 retries only the affected decision and reduces concurrency', () => {
+  const f = fixture(30, {modelResponder({call}) {
+    if (call === 1) return response({error: 'rate limited'}, 429);
+    return response({answers: {label: {choice: 'L0', confidence: 1, probabilities: {L0: 1}}},
+      usage: {cost: 0.00001}});
+  }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed'); assert.equal(batch.job.processed, 30);
+  assert.equal(batch.job.providerRetries, 1); assert.equal(f.calls.model, 31);
+  assert.equal(f.ctx.loadJob_().jevConcurrency, 17);
+});
+
+test('persistent OpenRouter 429 pauses after one probe without retrying the whole wave', () => {
+  const f = fixture(10, {modelResponder() { return response({error: 'rate limited'}, 429); }});
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'paused'); assert.equal(batch.job.stopReason, 'provider-temporary');
+  assert.equal(batch.job.processed, 0); assert.equal(batch.job.providerRetries, 1);
+  assert.equal(f.calls.model, 11);
+});
+
 test('full-content fallbacks form one second parallel wave', () => {
   const f = fixture(10, {confidence: 0.5}); const job = f.batch(f.start().id).job;
   assert.equal(job.status, 'completed'); assert.equal(job.fullBody, 10);
@@ -152,11 +284,57 @@ test('full-content fallbacks form one second parallel wave', () => {
   assert.equal(job.modelRequests, 20);
 });
 
+test('fifty full-content fallbacks use a second adaptive Gmail batch wave', () => {
+  const f = fixture(50, {confidence: 0.5}); const job = f.batch(f.start().id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.fullBody, 50);
+  assert.deepEqual(f.calls.gmailBatchItems.map(batch => batch.length), [25, 25, 35, 15]);
+  assert.equal(f.calls.model, 100); assert.equal(f.calls.fetchAll, 4);
+});
+
 test('low confidence requires full content, and archive uses the final confidence', () => {
   const f = fixture(1, {dryRun: false, archive: true, confidence: 0.8}); let job = f.start();
   job = f.batch(job.id).job;
   assert.equal(f.calls.full, 1); assert.equal(f.calls.model, 2); assert.equal(job.archived, 1);
   assert.ok(f.calls.writes[0].removeLabelIds.includes('INBOX'));
+});
+
+test('live mode applies one grouped Gmail write per final label', () => {
+  const f = fixture(50, {dryRun: false}); const job = f.batch(f.start().id).job;
+  assert.equal(job.processed, 50); assert.equal(f.calls.writes.length, 1);
+  assert.equal(f.calls.writes[0].ids.length, 50);
+  assert.equal(new Set(f.calls.writes[0].ids).size, 50);
+});
+
+test('persistent Gmail write throttling pauses with reusable decisions', () => {
+  const f = fixture(5, {dryRun: false, failWritesPersistently: true}); let job = f.start();
+  let batch = f.batch(job.id); job = batch.job;
+  assert.equal(job.status, 'paused'); assert.equal(job.stopReason, 'gmail-temporary');
+  assert.equal(job.processed, 0); assert.equal(f.calls.model, 5); assert.equal(f.calls.writeAttempts, 2);
+  assert.ok(f.ctx.loadJob_().pending.every(item => item.final));
+
+  f.settings.failWritesPersistently = false;
+  f.ctx.resumeTriageJob(job.id); batch = f.batch(job.id); job = batch.job;
+  assert.equal(job.processed, 5); assert.equal(f.calls.model, 5);
+  assert.equal(f.calls.writes.length, 1);
+});
+
+test('a partially applied grouped write replays idempotently and preserves counters', () => {
+  const settings = {dryRun: false, failWritesFromAttempt: 2, modelResponder({payload}) {
+    const even = Number(payload.state.email.subject.split(' ').pop()) % 2 === 0;
+    return response({answers: {label: {choice: even ? 'L1' : 'L0', confidence: 1,
+      probabilities: even ? {L0: 0, L1: 1} : {L0: 1, L1: 0}}}, usage: {cost: 0.00001}});
+  }};
+  const f = fixture(6, settings);
+  f.options.rules = [f.rules[0], {id: 'second', name: 'action', description: 'Action needed.', spam: false}];
+  let job = f.start(); job = f.batch(job.id).job;
+  assert.equal(job.status, 'paused'); assert.equal(job.processed, 0);
+  assert.equal(f.calls.model, 6); assert.equal(f.calls.writes.length, 1);
+
+  settings.failWritesFromAttempt = 0;
+  f.ctx.resumeTriageJob(job.id); job = f.batch(job.id).job;
+  assert.equal(job.processed, 6); assert.equal(f.calls.model, 6);
+  assert.equal(job.labelCounts.safe, 3); assert.equal(job.labelCounts.second, 3);
+  assert.equal(new Set(f.calls.writes.flatMap(write => write.ids)).size, 6);
 });
 
 test('unavailable required body uses the safe review fallback and later messages continue', () => {
@@ -167,7 +345,8 @@ test('unavailable required body uses the safe review fallback and later messages
   }
   assert.equal(job.status, 'completed'); assert.equal(job.processed, 19);
   assert.equal(job.skipped, 0); assert.equal(job.failed, 0); assert.equal(job.target, 19);
-  assert.equal(f.calls.model, 37); assert.equal(f.calls.full, 19); assert.equal(f.calls.writes.length, 19);
+  assert.equal(f.calls.model, 37); assert.equal(f.calls.full, 19); assert.equal(f.calls.writes.length, 1);
+  assert.equal(f.calls.writes[0].ids.length, 19);
   assert.ok(f.calls.writes.some(request => request.ids.includes('1')));
   assert.ok(events.some(event => event.level === 'warn' && /safe “review” fallback/.test(event.message)));
   assert.ok(results.some(row => row.subject === 'Message 1' && row.action === 'review fallback applied'));
@@ -180,7 +359,8 @@ test('messages without content or a review fallback are skipped and count toward
   let job = f.start();
   for (let i = 0; i < 4 && job.status === 'running'; i++) job = f.batch(job.id).job;
   assert.equal(job.status, 'completed'); assert.equal(job.processed, 9);
-  assert.equal(job.skipped, 1); assert.equal(job.target, 10); assert.equal(f.calls.writes.length, 9);
+  assert.equal(job.skipped, 1); assert.equal(job.target, 10); assert.equal(f.calls.writes.length, 1);
+  assert.equal(f.calls.writes[0].ids.length, 9);
 });
 
 test('budget prevents dispatch and all Gmail message writes', () => {
@@ -279,6 +459,16 @@ test('probability validation reports precise contract failures and permits bound
   assert.equal(parse({L0: 0.7, L1: 0.3, other: 0}).code, 'unexpected_probability_keys');
   assert.equal(parse({L0: 0.7, L1: 0.27}).code, 'probability_sum_mismatch');
   assert.equal(parse({L0: 0.51, L1: 0.5}).ok, true);
+});
+
+test('the typed Jev choice remains authoritative when probability argmax differs', () => {
+  const f = fixture();
+  const rules = [f.rules[0], {...f.rules[0], id: 'second'}];
+  const parsed = f.ctx.parseJevResponse_(response({answers: {label: {
+    choice: 'L1', confidence: 0.2, probabilities: {L0: 0.55, L1: 0.45}
+  }}}), rules, 0.01);
+  assert.equal(parsed.ok, true); assert.equal(parsed.ruleId, 'second');
+  assert.equal(parsed.choiceDiffersFromArgmax, true); assert.equal(parsed.probabilityArgmax, 'L0');
 });
 
 test('an invalid Jev distribution is retried once and a valid retry is used', () => {
