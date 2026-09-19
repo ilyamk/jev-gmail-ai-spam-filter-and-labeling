@@ -2757,8 +2757,15 @@ function extractMessageContent_(
     inlineTextParts: 0,
     externalTextParts: 0,
     externalTextErrors: 0,
+    decodedTextParts: 0,
+    decodedHtmlParts: 0,
+    byteArrayParts: 0,
+    base64UrlParts: 0,
+    decodeErrors: 0,
+    charsetFallbacks: 0,
     emptyDecodedParts: 0,
-    skippedAttachments: 0
+    skippedAttachments: 0,
+    lastDecodeError: ''
   };
 
 
@@ -2826,13 +2833,17 @@ function extractMessageContent_(
 
       reason = 'The text MIME parts contained no body data.';
 
-    } else if (html.length) {
+    } else if (diagnostics.decodeErrors > 0) {
 
-      reason = 'The HTML body contained no readable visible text.';
+      reason = 'Gmail returned text body data, but it could not be decoded safely.';
+
+    } else if (diagnostics.decodedHtmlParts > 0) {
+
+      reason = 'The HTML body decoded successfully but contained no readable visible text.';
 
     } else {
 
-      reason = 'The text body decoded to empty content.';
+      reason = 'The text body decoded successfully but contained no readable content.';
     }
   }
 
@@ -2893,15 +2904,15 @@ function collectTextParts_(
   let data = part.body && part.body.data;
 
 
-  if (data && isTextPart && diagnostics) diagnostics.inlineTextParts += 1;
+  if (hasMessagePartData_(data) && isTextPart && diagnostics) diagnostics.inlineTextParts += 1;
 
 
-  if (!data && messageId && part.body && part.body.attachmentId && isTextPart) {
+  if (!hasMessagePartData_(data) && messageId && part.body && part.body.attachmentId && isTextPart) {
 
     try {
 
       data = Gmail.Users.Messages.Attachments.get('me', messageId, part.body.attachmentId).data;
-      if (data && diagnostics) diagnostics.externalTextParts += 1;
+      if (hasMessagePartData_(data) && diagnostics) diagnostics.externalTextParts += 1;
 
     } catch (ignored) {
 
@@ -2910,37 +2921,42 @@ function collectTextParts_(
   }
 
 
-  if (
+  if (hasMessagePartData_(data) && isTextPart) {
 
-    data &&
-
-    mime ===
-    'text/plain'
-  ) {
-
-    const decodedPlain = decodeBase64UrlUtf8_(data);
+    const decoded = decodeMessagePartData_(
+      data,
+      getMimePartCharset_(part)
+    );
 
 
-    if (!decodedPlain.trim() && diagnostics) diagnostics.emptyDecodedParts += 1;
+    if (diagnostics) {
+
+      if (decoded.inputType === 'bytes') diagnostics.byteArrayParts += 1;
+      if (decoded.inputType === 'base64url') diagnostics.base64UrlParts += 1;
+
+      if (!decoded.ok) {
+        diagnostics.decodeErrors += 1;
+        diagnostics.lastDecodeError = decoded.error;
+      } else {
+        diagnostics.decodedTextParts += 1;
+        if (mime === 'text/html') diagnostics.decodedHtmlParts += 1;
+        if (decoded.usedCharsetFallback) diagnostics.charsetFallbacks += 1;
+        if (!decoded.text.trim()) diagnostics.emptyDecodedParts += 1;
+      }
+    }
 
 
-    plain.push(decodedPlain);
+    // Never add a failed decode to the content arrays. Previously an empty
+    // failed HTML decode made html.length truthy and produced the misleading
+    // "no readable visible text" warning.
+    if (decoded.ok && decoded.text.trim()) {
 
-  } else if (
-
-    data &&
-
-    mime ===
-    'text/html'
-  ) {
-
-    const decodedHtml = decodeBase64UrlUtf8_(data);
-
-
-    if (!decodedHtml.trim() && diagnostics) diagnostics.emptyDecodedParts += 1;
-
-
-    html.push(decodedHtml);
+      if (mime === 'text/plain') {
+        plain.push(decoded.text);
+      } else {
+        html.push(decoded.text);
+      }
+    }
   }
 
 
@@ -2971,34 +2987,219 @@ function collectTextParts_(
 
 
 /**
- * Gmail body data is base64url encoded.
+ * Return whether a Gmail message part contains usable body data.
+ *
+ * The public Gmail REST API exposes bytes as base64url strings. Apps Script's
+ * Advanced Gmail service can expose the same bytes as a Byte[] instead, so a
+ * truthy string-only check is not sufficient.
+ */
+function hasMessagePartData_(
+  data
+) {
+
+  if (data === null || data === undefined) return false;
+
+
+  if (typeof data === 'string') return data.trim().length > 0;
+
+
+  return typeof data.length === 'number' && data.length > 0;
+}
+
+
+
+/**
+ * Read a MIME part's declared charset. UTF-8 is the safe default used by
+ * Gmail and by Blob#getDataAsString when no supported declaration is present.
+ */
+function getMimePartCharset_(
+  part
+) {
+
+  const headers = part && part.headers || [];
+
+
+  let contentType = '';
+
+
+  headers.some(function(header) {
+
+    if (String(header.name || '').toLowerCase() !== 'content-type') return false;
+
+
+    contentType = String(header.value || '');
+    return true;
+  });
+
+
+  const match = contentType.match(/(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i);
+  const declared = match && (match[1] || match[2] || match[3]) || '';
+
+
+  // Charset names are data, not instructions. Keep the value deliberately
+  // narrow before passing it to the Apps Script Blob decoder.
+  if (!/^[a-z0-9._-]{1,40}$/i.test(declared)) return 'UTF-8';
+
+
+  return declared;
+}
+
+
+
+/**
+ * Convert an Apps Script Byte[] (signed bytes) or another array-like byte
+ * representation into the Byte[] expected by Utilities.newBlob.
+ */
+function normalizeMessagePartBytes_(
+  data
+) {
+
+  if (!data || typeof data === 'string' || typeof data.length !== 'number') {
+    throw new Error('unsupported_body_data');
+  }
+
+
+  const bytes = [];
+
+
+  for (let index = 0; index < data.length; index += 1) {
+
+    let value = Number(data[index]);
+
+
+    if (!Number.isFinite(value) || Math.floor(value) !== value || value < -128 || value > 255) {
+      throw new Error('invalid_byte_array');
+    }
+
+
+    // Typed arrays use 0..255; Apps Script Byte[] uses -128..127.
+    if (value > 127) value -= 256;
+    bytes.push(value);
+  }
+
+
+  return bytes;
+}
+
+
+
+/**
+ * Normalize and pad a Gmail REST base64url value before decoding it.
+ */
+function normalizeBase64Url_(
+  data
+) {
+
+  const value = String(data || '').replace(/\s+/g, '').replace(/=+$/g, '');
+
+
+  if (!value || !/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) {
+    throw new Error('invalid_base64url');
+  }
+
+
+  return value + '==='.slice((value.length + 3) % 4);
+}
+
+
+
+/**
+ * Decode one Gmail text part.
+ *
+ * Gmail REST documents body.data as base64url, while Apps Script Advanced
+ * Services may deserialize API `bytes` fields into Byte[]. Supporting both
+ * representations avoids double-decoding real Gmail message bodies.
+ */
+function decodeMessagePartData_(
+  data,
+  charset
+) {
+
+  const result = {
+    ok: false,
+    text: '',
+    error: '',
+    inputType: '',
+    byteLength: 0,
+    charset: charset || 'UTF-8',
+    usedCharsetFallback: false
+  };
+
+
+  let bytes;
+
+
+  try {
+
+    if (typeof data === 'string') {
+
+      result.inputType = 'base64url';
+      const encoded = normalizeBase64Url_(data);
+
+
+      try {
+
+        bytes = Utilities.base64DecodeWebSafe(encoded);
+
+      } catch (webSafeError) {
+
+        // Some Apps Script runtimes are stricter about web-safe padding. The
+        // standard alphabet fallback represents the exact same bytes.
+        if (!Utilities.base64Decode) throw webSafeError;
+        bytes = Utilities.base64Decode(
+          encoded.replace(/-/g, '+').replace(/_/g, '/')
+        );
+      }
+
+    } else {
+
+      result.inputType = 'bytes';
+      bytes = normalizeMessagePartBytes_(data);
+    }
+
+
+    result.byteLength = bytes.length;
+
+
+    const blob = Utilities.newBlob(bytes);
+
+
+    try {
+
+      result.text = blob.getDataAsString(result.charset);
+
+    } catch (charsetError) {
+
+      if (String(result.charset).toUpperCase() === 'UTF-8') throw charsetError;
+      result.text = blob.getDataAsString('UTF-8');
+      result.usedCharsetFallback = true;
+      result.charset = 'UTF-8';
+    }
+
+
+    result.ok = true;
+    return result;
+
+  } catch (error) {
+
+    result.error = error && error.message || 'message_part_decode_failed';
+    return result;
+  }
+}
+
+
+
+/**
+ * Backward-compatible text-only helper used by older integrations/tests.
  */
 function decodeBase64UrlUtf8_(
   data
 ) {
 
-  try {
-
-    const bytes =
-      Utilities
-        .base64DecodeWebSafe(
-          String(data)
-        );
+  const decoded = decodeMessagePartData_(data, 'UTF-8');
 
 
-    return Utilities
-      .newBlob(
-        bytes
-      )
-      .getDataAsString(
-        'UTF-8'
-      );
-
-
-  } catch (e) {
-
-    return '';
-  }
+  return decoded.ok ? decoded.text : '';
 }
 
 

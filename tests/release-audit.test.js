@@ -28,8 +28,15 @@ function fixture(count = 3, settings = {}) {
     Utilities: {
       getUuid: () => 'uuid-' + (++serial),
       base64DecodeWebSafe: s => Buffer.from(s, 'base64url'),
+      base64Decode: s => Buffer.from(s, 'base64'),
       sleep: () => {},
-      newBlob: value => ({getBytes: () => [...Buffer.from(value)], getDataAsString: () => Buffer.from(value).toString('utf8')})
+      newBlob: value => {
+        const bytes = Buffer.from(value);
+        return {
+          getBytes: () => [...bytes],
+          getDataAsString: charset => bytes.toString(/^iso-8859-1$/i.test(charset || '') ? 'latin1' : 'utf8')
+        };
+      }
     },
     Gmail: {Users: {
       Labels: {
@@ -310,6 +317,87 @@ test('image-heavy HTML preserves readable alt and title text', () => {
     '<html><body><img alt="Remove your background"><img title="Open editor"></body></html>'
   )}}});
   assert.equal(body, 'Remove your background Open editor');
+});
+
+test('Apps Script Byte[] Gmail bodies are decoded without a second base64 pass', () => {
+  const f = fixture();
+  const html = '<html><body><h1>Weekly Digest</h1><p>A small AI agent pattern I can reuse every Friday — письма.</p></body></html>';
+  const bytes = [...Buffer.from(html)].map(value => value > 127 ? value - 256 : value);
+  const extracted = f.ctx.extractMessageContent_({payload: {
+    mimeType: 'text/html',
+    headers: [{name: 'Content-Type', value: 'text/html; charset="UTF-8"'}],
+    body: {data: bytes}
+  }});
+  assert.match(extracted.text, /Weekly Digest/);
+  assert.match(extracted.text, /small AI agent pattern/);
+  assert.match(extracted.text, /письма/);
+  assert.equal(extracted.diagnostics.byteArrayParts, 1);
+  assert.equal(extracted.diagnostics.decodeErrors, 0);
+});
+
+test('a low-confidence message with an Apps Script Byte[] HTML body reaches Jev full-content review', () => {
+  let fullBody = '';
+  const f = fixture(1, {modelResponder({payload}) {
+    const isFull = payload.state.evidence_stage === 'full_body';
+    if (isFull) fullBody = payload.state.email.body;
+    const confidence = isFull ? 0.96 : 0.5;
+    return response({answers: {label: {choice: 'L0', confidence, probabilities: {L0: 1}}}});
+  }});
+  const originalGet = f.ctx.Gmail.Users.Messages.get;
+  f.ctx.Gmail.Users.Messages.get = (user, id, options) => {
+    const message = originalGet(user, id, options);
+    if (options.format === 'full') {
+      const html = '<html><body><h1>Weekly Digest</h1><p>Three useful articles about AI automation.</p></body></html>';
+      message.payload.mimeType = 'text/html';
+      message.payload.headers.push({name: 'Content-Type', value: 'text/html; charset=UTF-8'});
+      message.payload.body.data = [...Buffer.from(html)].map(value => value > 127 ? value - 256 : value);
+    }
+    return message;
+  };
+  const batch = f.batch(f.start().id);
+  assert.equal(batch.job.status, 'completed');
+  assert.equal(f.calls.full, 1);
+  assert.equal(f.calls.model, 2);
+  assert.ok(!batch.events.some(event => /Could not extract full text/.test(event.message)));
+  assert.equal(batch.results[0].stage, 'full');
+  assert.match(fullBody, /Weekly Digest/);
+  assert.match(fullBody, /Three useful articles/);
+});
+
+test('MIME charset is honored for byte-array text bodies', () => {
+  const f = fixture();
+  const bytes = [...Buffer.from('Caf\xe9', 'latin1')].map(value => value > 127 ? value - 256 : value);
+  const extracted = f.ctx.extractMessageContent_({payload: {
+    mimeType: 'text/plain',
+    headers: [{name: 'Content-Type', value: 'text/plain; charset=ISO-8859-1'}],
+    body: {data: bytes}
+  }});
+  assert.equal(extracted.text, 'Café');
+  assert.equal(extracted.diagnostics.decodedTextParts, 1);
+});
+
+test('decode failures are reported accurately instead of as empty visible HTML', () => {
+  const f = fixture();
+  const extracted = f.ctx.extractMessageContent_({payload: {
+    mimeType: 'text/html',
+    body: {data: {length: 1, 0: 'not-a-byte'}}
+  }});
+  assert.equal(extracted.text, '');
+  assert.equal(extracted.reason, 'Gmail returned text body data, but it could not be decoded safely.');
+  assert.equal(extracted.diagnostics.decodeErrors, 1);
+  assert.equal(extracted.diagnostics.decodedHtmlParts, 0);
+});
+
+test('successfully decoded empty HTML keeps the precise empty-content reason', () => {
+  const f = fixture(); const enc = s => Buffer.from(s).toString('base64url');
+  const extracted = f.ctx.extractMessageContent_({payload: {
+    mimeType: 'text/html',
+    body: {data: enc('<html><head><style>.hidden{display:none}</style></head><body></body></html>')}
+  }});
+  assert.equal(extracted.text, '');
+  assert.equal(extracted.reason, 'The HTML body decoded successfully but contained no readable visible text.');
+  assert.equal(extracted.diagnostics.decodeErrors, 0);
+  assert.equal(extracted.diagnostics.decodedHtmlParts, 1);
 });
 
 test('external Gmail text-part failures return safe MIME diagnostics instead of throwing', () => {
