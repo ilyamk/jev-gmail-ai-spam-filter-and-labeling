@@ -8,8 +8,8 @@
  * 2) Deploy/Test deployments -> Web app.
  * 3) Open the web app URL and paste an OpenRouter API key.
  *
- * Each email gets its own Decisions request. Processing checkpoints each
- * decision and Gmail write before moving to the next message in the batch.
+ * Each email gets its own Decisions request. Independent requests are sent in
+ * bounded parallel waves; decisions and every Gmail write are checkpointed.
  */
 
 
@@ -58,7 +58,7 @@ const APP = Object.freeze({
    * Maximum body text sent to Jev on full-body fallback.
    */
   MAX_BODY_CHARS:
-    7000,
+    5000,
 
 
   /**
@@ -70,7 +70,7 @@ const APP = Object.freeze({
    * Every email still receives its own independent Jev request.
    */
   BATCH_SIZE:
-    8,
+    10,
 
 
   /**
@@ -1364,6 +1364,22 @@ function startTriageJob(
         0,
 
 
+      reportedCostUsd:
+        0,
+
+
+      tokenCalculatedCostUsd:
+        0,
+
+
+      estimatedCostUsd:
+        0,
+
+
+      modelRequests:
+        0,
+
+
       ruleLabels: rules.map(function(rule) { return {id: rule.id, name: rule.name, spam: rule.spam}; }),
 
       labelCounts:
@@ -1442,9 +1458,13 @@ function startTriageJob(
 
 
 /**
- * Process one small batch.
+ * Process one batch through two bounded parallel waves:
  *
- * The browser automatically calls this again while job.status=running.
+ * 1) classify every message from metadata;
+ * 2) classify only low-confidence messages from full content.
+ *
+ * Gmail writes remain sequential and checkpointed so a failed write can be
+ * resumed without paying for another model decision.
  */
 function processNextBatch(jobId, apiKey) {
   return withJobLock_(function() {
@@ -1453,21 +1473,28 @@ function processNextBatch(jobId, apiKey) {
     const events = [];
     const results = [];
     if (job.status !== 'running') return {job: sanitizeJobForUi_(job), events: events, results: results};
+
     const started = Date.now();
-    // Measure server work only. A closed tab must not keep the timer running.
     job.activeStartedAt = started;
+
     try {
       const rules = loadJobRules_();
       const key = resolveApiKey_(apiKey, false);
       const labelContext = job.dryRun ? null : {
         byName: ensureGmailLabels_(rules), technical: ensureTechnicalLabel_()
       };
+
       job.pending = job.pending || [];
       job.skipped = Number(job.skipped || 0);
       job.providerRetries = Number(job.providerRetries || 0);
       job.modelResponseSkips = Number(job.modelResponseSkips || 0);
       job.consecutiveJevFailures = Number(job.consecutiveJevFailures || 0);
       job.skippedMessageIds = Array.isArray(job.skippedMessageIds) ? job.skippedMessageIds : [];
+      job.reportedCostUsd = Number(job.reportedCostUsd || 0);
+      job.tokenCalculatedCostUsd = Number(job.tokenCalculatedCostUsd || 0);
+      job.estimatedCostUsd = Number(job.estimatedCostUsd || 0);
+      job.modelRequests = Number(job.modelRequests || 0);
+
       if (!job.pending.length) {
         const handled = getJobHandledCount_(job);
         if (job.limit !== 'all' && handled >= job.limit) {
@@ -1476,9 +1503,9 @@ function processNextBatch(jobId, apiKey) {
         } else {
           const wanted = Math.min(APP.BATCH_SIZE,
             job.limit === 'all' ? APP.BATCH_SIZE : job.limit - handled);
-          // Successful write-mode messages disappear from the query because
-          // they receive the technical marker. Skipped messages do not. Ask
-          // for enough leading results to move past the remembered skips.
+          // Successful live-run messages disappear from the query after they
+          // receive the technical marker. Safely skipped messages do not, so
+          // read past their remembered IDs without moving the dry-run cursor.
           const maxResults = job.dryRun ? wanted : Math.min(500,
             wanted + job.skippedMessageIds.length);
           const options = {q: job.query, maxResults: maxResults};
@@ -1497,242 +1524,208 @@ function processNextBatch(jobId, apiKey) {
         }
         saveJob_(job);
       }
-      // The bounded queue is persisted before requests. Completed entries are
-      // removed individually, so a partial page can resume without duplicating it.
-      while (job.status === 'running' && job.pending.length) {
-        if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
-          job.status = 'paused';
-          job.stopReason = 'runtime-guard';
-          break;
+
+      if (job.status !== 'running') {
+        return {job: sanitizeJobForUi_(job), events: events, results: results};
+      }
+
+      const metadataById = Object.create(null);
+      const pendingSnapshot = job.pending.slice();
+
+      // Fetch metadata once per message. The same object is used for model
+      // input and the result table, avoiding the former second Gmail call.
+      pendingSnapshot.forEach(function(item) {
+        if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) return;
+        const message = Gmail.Users.Messages.get('me', item.id, {
+          format: 'metadata', metadataHeaders: APP.METADATA_HEADERS
+        });
+        metadataById[item.id] = normalizeMetadataMessage_(message);
+        if (!job.dryRun && (message.labelIds || []).indexOf(labelContext.technical.id) !== -1) {
+          removePendingItem_(job, item.id);
         }
-        const item = job.pending[0];
-        const ruleFor = function(parsed) {
-          const rule = ruleById_(rules, parsed.ruleId);
-          if (!rule) throw new Error('Jev selected an unknown classification rule.');
-          return rule;
-        };
-        const classify = function(metadata, stage, body) {
-          const payload = buildJevPayload_(metadata, rules, stage, body);
-          const payloadText = JSON.stringify(payload);
-          if (Utilities.newBlob(payloadText).getBytes().length > 29000) {
-            throw new Error('The classification request is too large. Shorten the label descriptions before starting a new session.');
-          }
-          const reserve = estimatePayloadCost_(payloadText);
-          const attempts = APP.JEV_RESPONSE_RETRIES + 1;
-          let parsed = null;
-          for (let attempt = 0; attempt < attempts; attempt++) {
-            if (job.spentUsd + reserve > job.maxSpendUsd) {
-              job.status = 'budget';
-              job.stopReason = 'budget';
-              return null;
-            }
-            if (attempt > 0) {
-              job.providerRetries += 1;
-              events.push({level: 'warn', message:
-                'Jev response validation failed (' + parsed.code + '): ' + parsed.error +
-                  ' Retrying once.'});
-              saveJob_(job);
-              Utilities.sleep(
-                Math.min(
-                  APP.MAX_JEV_RETRY_DELAY_MS,
-                  Math.max(APP.JEV_RETRY_DELAY_MS, Number(parsed.retryAfterMs) || 0)
-                )
-              );
-            }
-            // Reserve before every dispatch: a timeout or malformed response
-            // may still have incurred provider charges.
-            job.spentUsd += reserve;
-            saveJob_(job);
-            parsed = callJevParallel_([{payloadText: payloadText, estimatedCost: reserve}], key, rules)[0];
-            if (Number.isFinite(parsed.costUsd)) job.spentUsd += parsed.costUsd - reserve;
-            saveJob_(job);
-            if (parsed.ok) {
-              job.consecutiveJevFailures = 0;
-              saveJob_(job);
-              return parsed;
-            }
-            if (!parsed.retryable) throw new Error(parsed.error);
-          }
-          if (parsed && parsed.failureScope === 'session') {
-            job.status = 'paused';
-            job.stopReason = 'provider-temporary';
-            job.lastError = parsed.error;
-            events.push({level: 'warn', message:
-              parsed.error + ' Processing is paused; select Continue processing to try again later.'});
-            saveJob_(job);
-          }
-          return parsed;
-        };
+      });
 
-        const skipCurrentMessage = function(metadata, options) {
-          const details = options || {};
-          if (job.skippedMessageIds.indexOf(item.id) === -1) {
-            if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
-              throw new Error('Too many messages were skipped safely in this session. Start a new session with a narrower Gmail scope.');
-            }
-            job.skippedMessageIds.push(item.id);
-          }
-          job.skipped += 1;
-          if (details.modelResponse) job.modelResponseSkips += 1;
-          job.pending.shift();
-          const skippedSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
-          const skippedFrom = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
-          events.push({level: 'warn', message: details.message(skippedSubject, skippedFrom)});
-          results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
-            label: 'Not assigned', confidence: details.confidence === undefined ? '' : details.confidence,
-            stage: details.stage, action: details.action});
-          const handledAfterSkip = getJobHandledCount_(job);
-          job.target = Math.max(job.target, handledAfterSkip + job.pending.length);
-          if (job.limit !== 'all' && handledAfterSkip >= job.limit) {
-            job.status = 'completed';
-            job.stopReason = 'target-reached';
-          }
-          saveJob_(job);
-        };
+      if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
+        job.status = 'paused';
+        job.stopReason = 'runtime-guard';
+      }
 
-        const handleJevFailure = function(metadata, stage, parsed) {
-          if (job.status !== 'running') return false;
-          job.consecutiveJevFailures += 1;
-          if (job.consecutiveJevFailures >= APP.MAX_CONSECUTIVE_JEV_FAILURES) {
-            job.status = 'paused';
-            job.stopReason = 'jev-response-circuit-breaker';
-            job.lastError = 'Jev returned invalid responses for ' + job.consecutiveJevFailures +
-              ' consecutive messages. Processing was paused to protect the remaining API budget. Last issue: ' + parsed.error;
-            events.push({level: 'warn', message: job.lastError +
-              ' No Gmail changes were made to the current message. Continue later when the provider is stable.'});
-            saveJob_(job);
-            return false;
+      let budgetBlocked = false;
+
+      if (job.status === 'running') {
+        const metadataRequests = job.pending.filter(function(item) {
+          return !item.final && !item.metadataResult;
+        }).map(function(item) {
+          return createJevWaveRequest_(item, metadataById[item.id], rules, 'metadata', '');
+        });
+
+        const metadataWave = dispatchJevWave_(metadataRequests, key, rules, job, events);
+        budgetBlocked = budgetBlocked || metadataWave.budgetBlocked;
+
+        // Persist every successful answer before processing failures. If a
+        // later message opens the circuit breaker, completed decisions remain
+        // reusable after resume.
+        metadataRequests.forEach(function(request) {
+          if (request.result && request.result.ok) {
+            request.item.metadataResult = {
+              ruleId: request.result.ruleId,
+              confidence: request.result.confidence
+            };
           }
-          skipCurrentMessage(metadata, {
-            modelResponse: true,
-            stage: stage,
-            action: 'skipped-invalid-model-response',
-            message: function(subject, from) {
-              return 'Skipped “' + subject + '” from ' + from + ' because the Jev response could not be validated after one retry (' +
-                parsed.code + '). ' + parsed.error;
-            }
-          });
-          return true;
-        };
-        if (!item.final) {
-          const message = Gmail.Users.Messages.get('me', item.id, {
-            format: 'metadata', metadataHeaders: APP.METADATA_HEADERS
-          });
-          // A message can have been labeled before a previous call timed out.
-          if (!job.dryRun && (message.labelIds || []).indexOf(labelContext.technical.id) !== -1) {
-            job.pending.shift();
-            saveJob_(job);
+        });
+        saveJob_(job);
+
+        for (let i = 0; i < metadataRequests.length && job.status === 'running'; i += 1) {
+          const request = metadataRequests[i];
+          if (!request.result) continue;
+          if (request.result.ok) {
+            job.consecutiveJevFailures = 0;
             continue;
           }
-          const metadata = normalizeMetadataMessage_(message);
-          let parsed = item.metadataResult;
-          if (!parsed) {
-            parsed = classify(metadata, 'metadata', '');
-            if (!parsed) break;
-            if (!parsed.ok) {
-              if (handleJevFailure(metadata, 'metadata', parsed)) continue;
-              break;
-            }
-            item.metadataResult = {ruleId: parsed.ruleId, confidence: parsed.confidence};
-            saveJob_(job);
-          }
-          let selected = ruleFor(parsed);
-          let stage = 'metadata';
-          if (parsed.confidence < job.metadataThreshold ||
-              (job.mode === 'labels_archive' && selected.spam && parsed.confidence < job.archiveThreshold)) {
-            if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
-              job.status = 'paused'; job.stopReason = 'runtime-guard'; break;
-            }
-            const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
-            const extracted = extractMessageContent_(full);
-            const body = extracted.text.slice(0, APP.MAX_BODY_CHARS);
-            if (!body) {
-              const reviewFallback = rules.filter(function(rule) {
-                return !rule.spam &&
-                  (rule.id === 'review' || String(rule.name || '').toLowerCase() === 'review');
-              })[0];
-              if (reviewFallback) {
-                selected = reviewFallback;
-                stage = 'metadata_fallback';
-                const fallbackSubject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
-                events.push({level: 'warn', message:
-                  'Could not extract full text from “' + fallbackSubject + '”: ' + extracted.reason +
-                  ' The safe “' + reviewFallback.name + '” fallback ' +
-                  (job.dryRun ? 'would be applied in a live run.' : 'will be applied without archiving.')});
-              } else {
-                skipCurrentMessage(metadata, {
-                  stage: 'metadata',
-                  confidence: round_(parsed.confidence, 3),
-                  action: 'skipped-no-content',
-                  message: function(subject, from) {
-                    return 'Skipped “' + subject + '” from ' + from + ' because the app could not extract readable text. ' +
-                      extracted.reason + ' No safe review fallback is configured, so no labels or archive actions were applied.';
-                  }
-                });
-                continue;
-              }
-            } else {
-              parsed = classify(metadata, 'full', body);
-              if (!parsed) break;
-              if (!parsed.ok) {
-                if (handleJevFailure(metadata, 'full', parsed)) continue;
-                break;
-              }
-              selected = ruleFor(parsed);
-              stage = 'full';
-            }
-          }
-          // Persist only the decision, never message text or headers.
-          item.final = {ruleId: selected.id, confidence: parsed.confidence, stage: stage};
-          delete item.metadataResult;
-          saveJob_(job);
+          handleParallelJevFailure_(job, request.item, request.metadata,
+            'metadata', request.result, events, results);
         }
+      }
+
+      if (job.status === 'running') {
+        const fullRequests = [];
+
+        job.pending.slice().forEach(function(item) {
+          if (item.final || !item.metadataResult) return;
+          const metadata = metadataById[item.id];
+          const selected = ruleById_(rules, item.metadataResult.ruleId);
+          if (!selected) throw new Error('Jev selected an unknown classification rule.');
+
+          const needsFull = item.metadataResult.confidence < job.metadataThreshold ||
+            (job.mode === 'labels_archive' && selected.spam &&
+              item.metadataResult.confidence < job.archiveThreshold);
+
+          if (!needsFull) {
+            item.final = {
+              ruleId: item.metadataResult.ruleId,
+              confidence: item.metadataResult.confidence,
+              stage: 'metadata'
+            };
+            delete item.metadataResult;
+            return;
+          }
+
+          if (Date.now() - started > APP.SERVER_CALL_RUNTIME_MS) {
+            job.status = 'paused';
+            job.stopReason = 'runtime-guard';
+            return;
+          }
+
+          const full = Gmail.Users.Messages.get('me', item.id, {format: 'full'});
+          const extracted = extractMessageContent_(full);
+          const body = compactMessageBody_(extracted.text);
+
+          if (!body) {
+            const reviewFallback = rules.filter(function(rule) {
+              return !rule.spam &&
+                (rule.id === 'review' || String(rule.name || '').toLowerCase() === 'review');
+            })[0];
+            if (reviewFallback) {
+              item.final = {
+                ruleId: reviewFallback.id,
+                confidence: item.metadataResult.confidence,
+                stage: 'metadata_fallback'
+              };
+              delete item.metadataResult;
+              events.push({level: 'warn', message:
+                'Could not extract full text from “' +
+                String(metadata.headers.subject || '(no subject)').slice(0, 160) + '”: ' + extracted.reason +
+                ' The safe “' + reviewFallback.name + '” fallback ' +
+                (job.dryRun ? 'would be applied in a live run.' : 'will be applied without archiving.')});
+            } else {
+              skipUnreadableMessage_(job, item, metadata, extracted.reason, events, results);
+            }
+            return;
+          }
+
+          fullRequests.push(createJevWaveRequest_(item, metadata, rules, 'full', body));
+        });
+
+        saveJob_(job);
+
+        if (job.status === 'running' && fullRequests.length) {
+          const fullWave = dispatchJevWave_(fullRequests, key, rules, job, events);
+          budgetBlocked = budgetBlocked || fullWave.budgetBlocked;
+
+          fullRequests.forEach(function(request) {
+            if (request.result && request.result.ok) {
+              request.item.final = {
+                ruleId: request.result.ruleId,
+                confidence: request.result.confidence,
+                stage: 'full'
+              };
+              delete request.item.metadataResult;
+            }
+          });
+          saveJob_(job);
+
+          for (let i = 0; i < fullRequests.length && job.status === 'running'; i += 1) {
+            const request = fullRequests[i];
+            if (!request.result) continue;
+            if (request.result.ok) {
+              job.consecutiveJevFailures = 0;
+              continue;
+            }
+            handleParallelJevFailure_(job, request.item, request.metadata,
+              'full', request.result, events, results);
+          }
+        }
+      }
+
+      // Apply only the resolved prefix. An unresolved budget-blocked message
+      // stays at the front so resume preserves inbox order and reuses all
+      // already persisted decisions behind it.
+      while (job.pending.length && job.pending[0].final) {
+        const item = job.pending[0];
         const decision = item.final;
-        const selected = ruleFor(decision);
+        const selected = ruleById_(rules, decision.ruleId);
+        if (!selected) throw new Error('Jev selected an unknown classification rule.');
         const final = makeFinalResult_({ref: {id: item.id}}, decision, selected, decision.stage, job);
-        // Idempotent label operations can be retried with the saved decision
-        // without another paid model request if Gmail fails or the call times out.
         if (!job.dryRun) applyFinalResults_([final], rules, job, labelContext);
+
         job.processed += 1;
         job.labelCounts[selected.id] = Number(job.labelCounts[selected.id] || 0) + 1;
         if (decision.stage === 'metadata' || decision.stage === 'metadata_fallback') job.metadataOnly += 1;
         else job.fullBody += 1;
         if (final.archive && !job.dryRun) job.archived += 1;
         job.pending.shift();
-        if (!job.pending.length) {
-          if (job.dryRun) {
-            job.pageToken = job.nextPageToken || '';
-            if (!job.pageToken) { job.status = 'completed'; job.stopReason = 'no-more-messages'; }
-          }
-          if (job.limit !== 'all' && getJobHandledCount_(job) >= job.limit) {
-            job.status = 'completed'; job.stopReason = 'target-reached';
-          }
-        }
-        job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
-        saveJob_(job);
-        // Display metadata is deliberately not persisted in User Properties.
-        let headers = {};
-        try {
-          headers = normalizeMetadataMessage_(Gmail.Users.Messages.get('me', item.id, {
-            format: 'metadata', metadataHeaders: ['From', 'Subject']
-          })).headers;
-        } catch (ignored) {}
-        results.push({from: headers.from || '', subject: headers.subject || '', label: selected.name,
-          confidence: round_(decision.confidence, 3), stage: decision.stage,
+
+        const metadata = metadataById[item.id] || {headers: {from: '', subject: ''}};
+        results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+          label: selected.name, confidence: round_(decision.confidence, 3), stage: decision.stage,
           action: decision.stage === 'metadata_fallback'
             ? (job.dryRun ? 'would apply review fallback' : 'review fallback applied')
             : final.archive ? (job.dryRun ? 'would archive' : 'archived')
               : (job.dryRun ? 'would label' : 'labeled')});
+
+        job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
+        saveJob_(job);
       }
+
+      if (budgetBlocked && job.status === 'running') {
+        job.status = 'budget';
+        job.stopReason = 'budget';
+      }
+
       if (job.status === 'running' && !job.pending.length) {
         if (job.dryRun) {
           job.pageToken = job.nextPageToken || '';
-          if (!job.pageToken) { job.status = 'completed'; job.stopReason = 'no-more-messages'; }
+          if (!job.pageToken) {
+            job.status = 'completed';
+            job.stopReason = 'no-more-messages';
+          }
         }
         if (job.limit !== 'all' && getJobHandledCount_(job) >= job.limit) {
-          job.status = 'completed'; job.stopReason = 'target-reached';
+          job.status = 'completed';
+          job.stopReason = 'target-reached';
         }
       }
+
       if (job.status === 'completed') job.target = getJobHandledCount_(job);
       if (job.status === 'budget') {
         events.push({level: 'warn', message:
@@ -1751,13 +1744,228 @@ function processNextBatch(jobId, apiKey) {
       job.lastError = String(error && error.message || error).slice(0, 500);
       events.push({level: 'error', message: job.lastError});
     } finally {
-      job.elapsedMs = Number(job.elapsedMs || 0) + Math.max(0, Date.now() - started);
+      // A pause helper may already have checkpointed and closed the active
+      // segment through syncJobTiming_. Only add time that is still active.
+      const activeStartedAt = Number(job.activeStartedAt || 0);
+      if (activeStartedAt) {
+        job.elapsedMs = Number(job.elapsedMs || 0) + Math.max(0, Date.now() - activeStartedAt);
+      }
       job.activeStartedAt = 0;
       if (job.status !== 'running') job.finishedAt = Date.now();
       saveJob_(job);
     }
+
     return {job: sanitizeJobForUi_(job), events: events, results: results};
   });
+}
+
+
+
+
+/**
+ * Build one independent request for a parallel Jev wave.
+ */
+function createJevWaveRequest_(item, metadata, rules, stage, body) {
+  if (!metadata) throw new Error('Gmail metadata is unavailable for a pending message.');
+  const payloadText = JSON.stringify(buildJevPayload_(metadata, rules, stage, body));
+  if (Utilities.newBlob(payloadText).getBytes().length > 29000) {
+    throw new Error('The classification request is too large. Shorten the label descriptions before starting a new session.');
+  }
+  return {
+    item: item,
+    metadata: metadata,
+    stage: stage,
+    payloadText: payloadText,
+    estimatedCost: estimatePayloadCost_(payloadText),
+    result: null
+  };
+}
+
+
+/**
+ * Apply a completed request's cost while replacing its pre-request reserve.
+ */
+function accountJevRequestCost_(job, request, parsed) {
+  const reserved = Math.max(0, Number(request.estimatedCost) || 0);
+  const cost = Math.max(0, Number(parsed && parsed.costUsd) || 0);
+  job.spentUsd = Math.max(0, Number(job.spentUsd || 0) + cost - reserved);
+
+  if (parsed && parsed.costSource === 'reported') {
+    job.reportedCostUsd = Number(job.reportedCostUsd || 0) + cost;
+  } else if (parsed && parsed.costSource === 'input_tokens') {
+    job.tokenCalculatedCostUsd = Number(job.tokenCalculatedCostUsd || 0) + cost;
+  } else {
+    job.estimatedCostUsd = Number(job.estimatedCostUsd || 0) + cost;
+  }
+}
+
+
+/**
+ * Dispatch independent Jev requests concurrently with one bounded retry wave.
+ * Requests that do not fit the user's remaining budget are left unresolved.
+ */
+function dispatchJevWave_(requests, apiKey, rules, job, events) {
+  let budgetBlocked = false;
+
+  const dispatch = function(candidates) {
+    const selected = [];
+    let reserve = 0;
+
+    for (let i = 0; i < candidates.length; i += 1) {
+      const request = candidates[i];
+      const nextReserve = Math.max(0, Number(request.estimatedCost) || 0);
+      if (Number(job.spentUsd || 0) + reserve + nextReserve > job.maxSpendUsd) {
+        budgetBlocked = true;
+        break;
+      }
+      selected.push(request);
+      reserve += nextReserve;
+    }
+
+    if (!selected.length) return [];
+
+    job.spentUsd = Number(job.spentUsd || 0) + reserve;
+    job.modelRequests = Number(job.modelRequests || 0) + selected.length;
+    saveJob_(job);
+
+    const parsed = callJevParallel_(selected, apiKey, rules);
+    selected.forEach(function(request, index) {
+      request.result = parsed[index];
+      accountJevRequestCost_(job, request, request.result);
+    });
+    saveJob_(job);
+    return selected;
+  };
+
+  const firstAttempt = dispatch(requests);
+  let retryable = firstAttempt.filter(function(request) {
+    return request.result && !request.result.ok && request.result.retryable;
+  });
+
+  if (retryable.length) {
+    const isBatchTransportFailure = retryable.length === firstAttempt.length && retryable.every(function(request) {
+      return request.result.failureScope === 'session' && request.result.code === retryable[0].result.code;
+    });
+
+    // For a batch-wide transport outage, probe one request first. If the
+    // provider is still unavailable, do not spend credits retrying the rest.
+    const probe = isBatchTransportFailure ? retryable.slice(0, 1) : [];
+    if (probe.length) {
+      const firstFailure = probe[0].result;
+      events.push({level: 'warn', message:
+        'Jev response validation failed (' + firstFailure.code + '): ' + firstFailure.error +
+        ' Retrying once.'});
+      probe[0].result = null;
+      job.providerRetries = Number(job.providerRetries || 0) + 1;
+      saveJob_(job);
+      Utilities.sleep(Math.min(APP.MAX_JEV_RETRY_DELAY_MS,
+        Math.max(APP.JEV_RETRY_DELAY_MS, Number(firstFailure.retryAfterMs) || 0)));
+      dispatch(probe);
+
+      if (!probe[0].result || !probe[0].result.ok) {
+        return {budgetBlocked: budgetBlocked};
+      }
+      retryable = retryable.slice(1);
+    } else {
+      // Retrying more invalid message responses than the circuit breaker can
+      // consume would spend credits without allowing any additional progress.
+      retryable = retryable.slice(0, Math.max(1,
+        APP.MAX_CONSECUTIVE_JEV_FAILURES - Number(job.consecutiveJevFailures || 0)));
+    }
+
+    if (!retryable.length) return {budgetBlocked: budgetBlocked};
+
+    let retryAfterMs = APP.JEV_RETRY_DELAY_MS;
+    retryable.forEach(function(request) {
+      retryAfterMs = Math.max(retryAfterMs, Number(request.result.retryAfterMs) || 0);
+      events.push({level: 'warn', message:
+        'Jev response validation failed (' + request.result.code + '): ' + request.result.error +
+        ' Retrying once.'});
+      request.result = null;
+    });
+
+    job.providerRetries = Number(job.providerRetries || 0) + retryable.length;
+    saveJob_(job);
+    Utilities.sleep(Math.min(APP.MAX_JEV_RETRY_DELAY_MS, retryAfterMs));
+    dispatch(retryable);
+  }
+
+  return {budgetBlocked: budgetBlocked};
+}
+
+
+function removePendingItem_(job, itemId) {
+  job.pending = (job.pending || []).filter(function(item) { return item.id !== itemId; });
+}
+
+
+function skipUnreadableMessage_(job, item, metadata, reason, events, results) {
+  if (job.skippedMessageIds.indexOf(item.id) === -1) {
+    if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
+      throw new Error('Too many messages were skipped safely in this session. Start a new session with a narrower Gmail scope.');
+    }
+    job.skippedMessageIds.push(item.id);
+  }
+  job.skipped += 1;
+  removePendingItem_(job, item.id);
+  const subject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
+  const from = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
+  events.push({level: 'warn', message:
+    'Skipped “' + subject + '” from ' + from + ' because the app could not extract readable text. ' +
+    reason + ' No safe review fallback is configured, so no labels or archive actions were applied.'});
+  results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+    label: 'Not assigned', confidence: '', stage: 'metadata', action: 'skipped-no-content'});
+  job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
+  saveJob_(job);
+}
+
+
+/**
+ * Preserve the existing fail-closed policy for provider and response errors.
+ */
+function handleParallelJevFailure_(job, item, metadata, stage, parsed, events, results) {
+  if (parsed.failureScope === 'session') {
+    if (!parsed.retryable) throw new Error(parsed.error);
+    job.status = 'paused';
+    job.stopReason = 'provider-temporary';
+    job.lastError = parsed.error;
+    events.push({level: 'warn', message:
+      parsed.error + ' Processing is paused; select Continue processing to try again later.'});
+    saveJob_(job);
+    return;
+  }
+
+  job.consecutiveJevFailures = Number(job.consecutiveJevFailures || 0) + 1;
+  if (job.consecutiveJevFailures >= APP.MAX_CONSECUTIVE_JEV_FAILURES) {
+    job.status = 'paused';
+    job.stopReason = 'jev-response-circuit-breaker';
+    job.lastError = 'Jev returned invalid responses for ' + job.consecutiveJevFailures +
+      ' consecutive messages. Processing was paused to protect the remaining API budget. Last issue: ' + parsed.error;
+    events.push({level: 'warn', message: job.lastError +
+      ' No Gmail changes were made to the current message. Continue later when the provider is stable.'});
+    saveJob_(job);
+    return;
+  }
+
+  if (job.skippedMessageIds.indexOf(item.id) === -1) {
+    if (job.skippedMessageIds.length >= APP.MAX_SKIPPED_MESSAGE_IDS) {
+      throw new Error('Too many messages were skipped safely in this session. Start a new session with a narrower Gmail scope.');
+    }
+    job.skippedMessageIds.push(item.id);
+  }
+  job.skipped += 1;
+  job.modelResponseSkips += 1;
+  removePendingItem_(job, item.id);
+
+  const subject = String(metadata.headers.subject || '(no subject)').slice(0, 160);
+  const from = String(metadata.headers.from || '(unknown sender)').slice(0, 160);
+  events.push({level: 'warn', message:
+    'Skipped “' + subject + '” from ' + from + ' because the Jev response could not be validated after one retry (' +
+    parsed.code + '). ' + parsed.error});
+  results.push({from: metadata.headers.from || '', subject: metadata.headers.subject || '',
+    label: 'Not assigned', confidence: '', stage: stage, action: 'skipped-invalid-model-response'});
+  job.target = Math.max(job.target, getJobHandledCount_(job) + job.pending.length);
+  saveJob_(job);
 }
 
 
@@ -3328,6 +3536,24 @@ function htmlToText_(
 
 
 
+/**
+ * Bound full-content cost while preserving both the opening context and the
+ * closing section where transactional details or unsubscribe language often
+ * appear. Short messages pass through unchanged.
+ */
+function compactMessageBody_(text) {
+  const normalized = String(text || '').trim();
+  if (normalized.length <= APP.MAX_BODY_CHARS) return normalized;
+
+  const tailLength = Math.min(800, Math.floor(APP.MAX_BODY_CHARS * 0.2));
+  const marker = '\n\n[Middle of long message omitted]\n\n';
+  const headLength = Math.max(0, APP.MAX_BODY_CHARS - tailLength - marker.length);
+  return normalized.slice(0, headLength).trimEnd() + marker +
+    normalized.slice(-tailLength).trimStart();
+}
+
+
+
 /* =====================================================================
  * JEV PAYLOAD / REQUESTS
  * ===================================================================== */
@@ -3444,7 +3670,12 @@ function buildJevPayload_(
 
 
   Object.keys(email).forEach(function(key) {
-    if (typeof email[key] === 'string') email[key] = email[key].slice(0, key === 'snippet' ? 1200 : 512);
+    if (typeof email[key] === 'string') {
+      email[key] = email[key].trim().slice(0, key === 'snippet' ? 1200 : 512);
+      if (!email[key]) delete email[key];
+    } else if (typeof email[key] === 'number' && !email[key]) {
+      delete email[key];
+    }
   });
 
   if (
@@ -3638,6 +3869,12 @@ function callJevParallel_(
               Number(item && item.estimatedCost) || 0
             ),
 
+          costSource:
+            'estimated',
+
+          inputTokens:
+            0,
+
           error:
 
             'OpenRouter could not be reached. The request will be retried once before processing is paused. Technical detail: ' +
@@ -3739,6 +3976,8 @@ function callJevSingle_(
       failureScope: 'session',
       retryAfterMs: 0,
       costUsd: estimatePayloadCost_(payloadText),
+      costSource: 'estimated',
+      inputTokens: 0,
       error: 'OpenRouter could not be reached. Check the network connection and try again. Technical detail: ' +
         String(e && e.message || e)
     };
@@ -3783,7 +4022,17 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
     (usage.total_cost !== undefined ? usage.total_cost : usage.totalCost);
   const actualCost = typeof rawCost === 'number' ? rawCost :
     (typeof rawCost === 'string' && rawCost.trim() ? Number(rawCost) : NaN);
-  const cost = Number.isFinite(actualCost) && actualCost >= 0 ? actualCost : estimated;
+  const rawInputTokens = usage.input_tokens !== undefined ? usage.input_tokens : usage.prompt_tokens;
+  const inputTokens = typeof rawInputTokens === 'number' ? rawInputTokens :
+    (typeof rawInputTokens === 'string' && rawInputTokens.trim() ? Number(rawInputTokens) : NaN);
+  const hasReportedCost = Number.isFinite(actualCost) && actualCost >= 0;
+  const hasInputTokens = Number.isFinite(inputTokens) && inputTokens >= 0;
+  const cost = hasReportedCost
+    ? actualCost
+    : hasInputTokens
+      ? inputTokens * APP.INPUT_RATE_USD_PER_MILLION / 1000000
+      : estimated;
+  const costSource = hasReportedCost ? 'reported' : hasInputTokens ? 'input_tokens' : 'estimated';
   const failure = function(code, message, options) {
     const details = options || {};
     return {
@@ -3791,6 +4040,8 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
       code: code,
       error: message,
       costUsd: cost,
+      costSource: costSource,
+      inputTokens: hasInputTokens ? inputTokens : 0,
       retryable: details.retryable !== false,
       failureScope: details.failureScope || 'message',
       retryAfterMs: Math.min(APP.MAX_JEV_RETRY_DELAY_MS, Math.max(0, retryAfterMs)),
@@ -3895,7 +4146,7 @@ function parseJevResponse_(response, rules, fallbackEstimatedCost) {
         probabilitySum: round_(total, 6)}});
   }
   return {ok: true, ruleId: rule.id, confidence: confidence, probabilities: probabilities,
-    costUsd: cost, inputTokens: Number(usage.input_tokens || usage.prompt_tokens || 0),
+    costUsd: cost, costSource: costSource, inputTokens: hasInputTokens ? inputTokens : 0,
     model: json.model || APP.MODEL, provider: json.provider || ''};
 }
 
@@ -4325,6 +4576,22 @@ function sanitizeJobForUi_(
       ),
 
 
+    reportedCostUsd:
+      round_(Number(job.reportedCostUsd || 0), 8),
+
+
+    tokenCalculatedCostUsd:
+      round_(Number(job.tokenCalculatedCostUsd || 0), 8),
+
+
+    estimatedCostUsd:
+      round_(Number(job.estimatedCostUsd || 0), 8),
+
+
+    modelRequests:
+      Number(job.modelRequests || 0),
+
+
     ruleLabels: job.ruleLabels || [],
 
     labelCounts:
@@ -4417,33 +4684,6 @@ function estimatePayloadCost_(payloadText) {
   const bytes = Utilities.newBlob(String(payloadText || '')).getBytes().length;
   return Math.ceil((bytes + 300) * APP.ESTIMATED_TOKENS_PER_CHAR) * APP.INPUT_RATE_USD_PER_MILLION / 1000000;
 }
-
-
-function sumEstimatedCost_(
-  items
-) {
-
-  return items.reduce(
-    function(
-      sum,
-      item
-    ) {
-
-      return (
-
-        sum +
-
-        Number(
-          item.estimatedCost ||
-          0
-        )
-      );
-    },
-
-    0
-  );
-}
-
 
 
 function clone_(
@@ -4997,12 +5237,13 @@ function getHtml_() {
           min="0.50"
           max="0.99"
           step="0.01"
-          value="0.82"
+          value="0.75"
         >
 
         <div class="help">
           If metadata confidence is below this value, the app retrieves the
-          message content and performs a second classification with Jev.
+          message content and performs a second classification with Jev. The
+          default balances classification quality, speed, and API cost.
         </div>
 
       </div>
@@ -5209,8 +5450,8 @@ function getHtml_() {
             <b id="sCost">
               $0.000000
             </b>
-            <small>
-              Reported usage plus unresolved request estimates
+            <small id="sCostNote">
+              Waiting for model usage
             </small>
           </div>
 
@@ -7397,6 +7638,12 @@ function getHtml_() {
 
 
       el(
+        'sCostNote'
+      ).textContent =
+        'Waiting for model usage';
+
+
+      el(
         'resumeBtn'
       ).style.display =
         'none';
@@ -7667,6 +7914,25 @@ function getHtml_() {
       ).toFixed(
         6
       );
+
+
+    el(
+      'sCost'
+    ).title =
+      '$' + Number(j.spentUsd || 0).toFixed(8);
+
+
+    var costSources = [];
+    if (Number(j.reportedCostUsd || 0) > 0) costSources.push('OpenRouter-reported cost');
+    if (Number(j.tokenCalculatedCostUsd || 0) > 0) costSources.push('token-based cost');
+    if (Number(j.estimatedCostUsd || 0) > 0) costSources.push('conservative estimate');
+    el(
+      'sCostNote'
+    ).textContent =
+      Number(j.modelRequests || 0) +
+      ' model request' +
+      (Number(j.modelRequests || 0) === 1 ? '' : 's') +
+      (costSources.length ? ' · ' + costSources.join(' + ') : '');
 
 
 

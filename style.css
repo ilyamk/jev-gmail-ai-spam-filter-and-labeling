@@ -936,6 +936,11 @@ a:focus-visible,
   white-space: nowrap;
 }
 
+#sCost {
+  font-size: 18px;
+  letter-spacing: -.025em;
+}
+
 .highlightMetric small {
   display: block;
   margin-top: 5px;

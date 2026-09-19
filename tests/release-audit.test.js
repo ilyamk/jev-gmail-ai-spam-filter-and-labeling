@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'CODE.gs'), 'utf8');
 
 function fixture(count = 3, settings = {}) {
   const data = new Map();
-  const calls = {model: 0, writes: [], full: 0};
+  const calls = {model: 0, writes: [], full: 0, fetchAll: 0, propertyWrites: 0};
   let serial = 0, locked = false, clock = 1000;
   const labels = [];
   const messages = Array.from({length: count}, (_, i) => ({id: String(i + 1), labelIds: ['INBOX']}));
@@ -17,6 +17,7 @@ function fixture(count = 3, settings = {}) {
     getProperty: k => data.has(k) ? data.get(k) : null,
     setProperty(k, v) {
       assert.ok(Buffer.byteLength(v) <= 9000, 'Apps Script property byte limit');
+      calls.propertyWrites++;
       data.set(k, v); return this;
     },
     deleteProperty: k => data.delete(k)
@@ -73,6 +74,7 @@ function fixture(count = 3, settings = {}) {
     }},
     UrlFetchApp: {
       fetchAll(requests) {
+        calls.fetchAll++;
         return requests.map(request => {
           calls.model++;
           assert.equal(request.headers.Authorization, 'Bearer ephemeral-key');
@@ -129,10 +131,25 @@ test('write failure resumes a persisted decision without another paid request', 
 test('a transient model transport failure retries once and continues the batch', () => {
   const f = fixture(10, {failModelAt: 2}); let job = f.start();
   let batch = f.batch(job.id); job = batch.job;
-  assert.equal(job.processed, 8); assert.equal(job.status, 'running'); assert.equal(job.providerRetries, 1);
+  assert.equal(job.processed, 10); assert.equal(job.status, 'completed'); assert.equal(job.providerRetries, 10);
   assert.ok(batch.events.some(event => /Retrying once/.test(event.message)));
-  job = f.batch(job.id).job;
-  assert.equal(job.processed, 10); assert.equal(job.status, 'completed'); assert.equal(f.calls.model, 11);
+  assert.equal(f.calls.model, 12); assert.equal(f.calls.fetchAll, 3);
+});
+
+test('ten metadata decisions are sent in one parallel HTTP wave', () => {
+  const f = fixture(10); const started = f.start(); const writesBeforeBatch = f.calls.propertyWrites;
+  const job = f.batch(started.id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.processed, 10);
+  assert.equal(f.calls.model, 10); assert.equal(f.calls.fetchAll, 1);
+  assert.equal(job.modelRequests, 10);
+  assert.ok(f.calls.propertyWrites - writesBeforeBatch <= 16);
+});
+
+test('full-content fallbacks form one second parallel wave', () => {
+  const f = fixture(10, {confidence: 0.5}); const job = f.batch(f.start().id).job;
+  assert.equal(job.status, 'completed'); assert.equal(job.fullBody, 10);
+  assert.equal(f.calls.model, 20); assert.equal(f.calls.fetchAll, 2);
+  assert.equal(job.modelRequests, 20);
 });
 
 test('low confidence requires full content, and archive uses the final confidence', () => {
@@ -200,6 +217,29 @@ test('confidence is not replaced by selected probability; malformed confidence f
   }
 });
 
+test('input token usage replaces the conservative cost estimate when provider cost is absent', () => {
+  const f = fixture();
+  const parsed = f.ctx.parseJevResponse_(response({answers: {label: {
+    choice: 'L0', confidence: 1, probabilities: {L0: 1}
+  }}, usage: {input_tokens: 1000, output_tokens: 20}}), f.rules, 0.5);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.costSource, 'input_tokens');
+  assert.equal(parsed.costUsd, 0.000042);
+  assert.equal(parsed.inputTokens, 1000);
+});
+
+test('cost source totals distinguish provider reports from token calculations', () => {
+  const f = fixture(1, {modelResponder() {
+    return response({answers: {label: {choice: 'L0', confidence: 1, probabilities: {L0: 1}}},
+      usage: {input_tokens: 1000}});
+  }});
+  const job = f.batch(f.start().id).job;
+  assert.equal(job.spentUsd, 0.000042);
+  assert.equal(job.reportedCostUsd, 0);
+  assert.equal(job.tokenCalculatedCostUsd, 0.000042);
+  assert.equal(job.estimatedCostUsd, 0);
+});
+
 test('Jev payload follows the Decisions Choice contract and keeps the latest model alias', () => {
   let captured;
   const f = fixture(1, {modelResponder({payload}) {
@@ -215,6 +255,18 @@ test('Jev payload follows the Decisions Choice contract and keeps the latest mod
   assert.equal(captured.questions.label.criteria.L0.assign_when, 'A message to review.');
   assert.equal(captured.state.evidence_stage, 'metadata_only');
   assert.equal(captured.state.email.subject, 'Message 1');
+  assert.ok(!Object.prototype.hasOwnProperty.call(captured.state.email, 'cc'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(captured.state.email, 'reply_to'));
+});
+
+test('long message bodies keep useful head and tail context within the configured limit', () => {
+  const f = fixture();
+  const body = 'HEAD:' + 'a'.repeat(7000) + ':TAIL';
+  const compact = f.ctx.compactMessageBody_(body);
+  assert.ok(compact.length <= 5000);
+  assert.match(compact, /^HEAD:/);
+  assert.match(compact, /:TAIL$/);
+  assert.match(compact, /Middle of long message omitted/);
 });
 
 test('probability validation reports precise contract failures and permits boundary noise', () => {
@@ -268,7 +320,7 @@ test('three consecutive invalid Jev responses open the circuit breaker without c
   assert.equal(batch.job.stopReason, 'jev-response-circuit-breaker');
   assert.equal(batch.job.processed, 0); assert.equal(batch.job.skipped, 2);
   assert.equal(batch.job.modelResponseSkips, 2); assert.equal(batch.job.providerRetries, 3);
-  assert.equal(f.calls.model, 6); assert.equal(f.calls.writes.length, 0);
+  assert.equal(f.calls.model, 7); assert.equal(f.calls.writes.length, 0);
   assert.match(batch.job.lastError, /3 consecutive messages/);
 });
 
